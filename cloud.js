@@ -1,4 +1,16 @@
-// --- 在文件最底部，粘贴以下全部代码 ---
+// cloud.js (完整修复版)
+
+const AV = require('leanengine'); // <-- 这是最关键的修复！
+
+/**
+ * 一个简单的云代码方法
+ */
+AV.Cloud.define('hello', function(request) {
+  return 'Hello world!';
+});
+
+
+// --- 在文件最底部，粘贴我们之前的代码 ---
 
 const qiniu = require('qiniu');
 
