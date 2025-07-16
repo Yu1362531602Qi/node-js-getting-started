@@ -91,3 +91,37 @@ AV.Cloud.define('toggleLikeCharacter', async (request) => {
   // 7. 返回更新后的喜欢列表给客户端，方便 UI 即时刷新
   return likedIds;
 });
+
+// --- vvv 在文件末尾添加以下所有代码 vvv ---
+
+const qiniu = require('qiniu');
+
+// 从环境变量中获取你的七牛云密钥
+const accessKey = process.env.QINIU_AK;
+const secretKey = process.env.QINIU_SK;
+// 你的七牛云空间名
+const bucket = process.env.QINIU_BUCKET_NAME;
+
+// 定义一个名为 getQiniuUploadToken 的云函数
+AV.Cloud.define('getQiniuUploadToken', async (request) => {
+  // 检查用户是否登录
+  if (!request.currentUser) {
+    throw new AV.Cloud.Error('用户未登录，禁止获取上传凭证。', { code: 401 });
+  }
+
+  const mac = new qiniu.auth.digest.Mac(accessKey, secretKey);
+  const options = {
+    scope: bucket,
+    expires: 3600, // token 有效期 1 小时
+  };
+  const putPolicy = new qiniu.rs.PutPolicy(options);
+  const uploadToken = putPolicy.uploadToken(mac);
+
+  if (uploadToken) {
+    return { token: uploadToken };
+  } else {
+    throw new AV.Cloud.Error('生成上传凭证失败。', { code: 500 });
+  }
+});
+
+// --- ^^^ 以上是所有需要添加的代码 ^^^ ---
