@@ -1,4 +1,4 @@
-// cloud.js (包含“一键发布”功能的最终完整版)
+// cloud.js (包含“状态同步”功能的最终完整版)
 
 'use strict';
 // 引入 LeanCloud SDK
@@ -59,20 +59,16 @@ AV.Cloud.define('toggleLikeCharacter', async (request) => {
   return likedIds;
 });
 
-// --- 函数 3: (核心) 获取七牛云上传凭证 (整合后的版本) ---
+// --- 函数 3: 获取七牛云上传凭证 (您的原始函数，保留) ---
 AV.Cloud.define('getQiniuUploadToken', async (request) => {
-  // 从环境变量中获取你的七牛云密钥
   const accessKey = process.env.QINIU_AK;
   const secretKey = process.env.QINIU_SK;
-  // 你的七牛云空间名
   const bucket = process.env.QINIU_BUCKET_NAME;
 
-  // 检查用户是否登录
   if (!request.currentUser) {
     throw new AV.Cloud.Error('用户未登录，禁止获取上传凭证。', { code: 401 });
   }
 
-  // 检查环境变量是否都已设置
   if (!accessKey || !secretKey || !bucket) {
     console.error('七牛云环境变量未完全设置 (QINIU_AK, QINIU_SK, QINIU_BUCKET_NAME)');
     throw new AV.Cloud.Error('服务器配置错误，无法生成上传凭证。', { code: 500 });
@@ -81,7 +77,7 @@ AV.Cloud.define('getQiniuUploadToken', async (request) => {
   const mac = new qiniu.auth.digest.Mac(accessKey, secretKey);
   const options = {
     scope: bucket,
-    expires: 3600, // token 有效期 1 小时
+    expires: 3600,
   };
   const putPolicy = new qiniu.rs.PutPolicy(options);
   const uploadToken = putPolicy.uploadToken(mac);
@@ -93,19 +89,8 @@ AV.Cloud.define('getQiniuUploadToken', async (request) => {
   }
 });
 
-
-// --- vvv 函数 4: (新增) 一键发布已批准的角色 vvv ---
-/**
- * [核心功能] 一键发布已批准的角色
- * 1. 查找 CharacterSubmissions 表中所有 status 为 'approved' 的记录。
- * 2. 获取当前 Character 表中最大的 ID，用于生成新 ID。
- * 3. 遍历所有已批准的提交：
- *    a. 在 Character 表中创建一个新角色。
- *    b. 将提交记录的 status 更新为 'published'，防止重复发布。
- * 4. 返回处理结果。
- */
+// --- 函数 4: 一键发布已批准的角色 (您的原始函数，保留) ---
 AV.Cloud.define('publishApprovedCharacters', async (request) => {
-  // 1. 查询所有已批准的提交
   const submissionQuery = new AV.Query('CharacterSubmissions');
   submissionQuery.equalTo('status', 'approved');
   const submissions = await submissionQuery.find();
@@ -114,39 +99,34 @@ AV.Cloud.define('publishApprovedCharacters', async (request) => {
     return '没有找到待发布的角色。';
   }
 
-  // 2. 获取当前官方角色中的最大 ID
   const charQuery = new AV.Query('Character');
-  charQuery.descending('id'); // 按 id 降序排序
-  charQuery.limit(1); // 只取最大的那一个
+  charQuery.descending('id');
+  charQuery.limit(1);
   const maxIdChar = await charQuery.first();
-  let maxId = maxIdChar ? maxIdChar.get('id') : 0; // 如果表为空，则从 0 开始
+  let maxId = maxIdChar ? maxIdChar.get('id') : 0;
 
   let successCount = 0;
   const failedSubmissions = [];
 
-  // 3. 遍历并发布每一个提交
   for (const submission of submissions) {
     try {
       const submissionData = submission.get('characterData');
       const imageUrl = submission.get('imageUrl');
-      const newId = ++maxId; // ID 递增
+      const newId = ++maxId;
 
-      // 3a. 创建新角色对象并设置属性
       const Character = AV.Object.extend('Character');
       const newChar = new Character();
       newChar.set('id', newId);
       newChar.set('name', submissionData.name);
       newChar.set('description', submissionData.description);
-      newChar.set('imageUrl', imageUrl); // 使用上传到七牛云的 URL
+      newChar.set('imageUrl', imageUrl);
       newChar.set('characterPrompt', submissionData.characterPrompt);
       newChar.set('userProfilePrompt', submissionData.userProfilePrompt);
       newChar.set('storyBackgroundPrompt', submissionData.storyBackgroundPrompt);
       newChar.set('storyStartPrompt', submissionData.storyStartPrompt);
       
-      // 使用 masterKey 保存，无视 ACL 限制
       await newChar.save(null, { useMasterKey: true });
 
-      // 3b. 更新提交记录的状态为 'published'
       submission.set('status', 'published');
       await submission.save();
 
@@ -157,11 +137,49 @@ AV.Cloud.define('publishApprovedCharacters', async (request) => {
     }
   }
 
-  // 4. 返回最终结果
   let resultMessage = `发布完成！成功发布 ${successCount} 个角色。`;
   if (failedSubmissions.length > 0) {
     resultMessage += ` 失败 ${failedSubmissions.length} 个，ID: ${failedSubmissions.join(', ')}。请检查日志。`;
   }
   return resultMessage;
+});
+
+
+// --- vvv 函数 5: (新增) 批量获取提交记录的最新状态 vvv ---
+/**
+ * [核心功能] 批量获取提交记录的最新状态
+ * 接收一个包含本地角色 ID 的数组，返回这些 ID 在云端的最新状态。
+ */
+AV.Cloud.define('getSubmissionStatuses', async (request) => {
+  // 1. 检查用户是否登录
+  const user = request.currentUser;
+  if (!user) {
+    throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
+  }
+
+  // 2. 从请求参数中获取本地角色 ID 列表
+  const { localIds } = request.params;
+  if (!Array.isArray(localIds) || localIds.length === 0) {
+    return {}; // 如果没有提供 ID，返回空对象
+  }
+
+  // 3. 构建查询
+  const submissionQuery = new AV.Query('CharacterSubmissions');
+  // 查询条件：提交者是当前用户，并且 localId 在传入的数组中
+  submissionQuery.equalTo('submitter', user);
+  submissionQuery.containedIn('localId', localIds); 
+  // 我们只需要 localId 和 status 两个字段，提高查询效率
+  submissionQuery.select(['localId', 'status']);
+  submissionQuery.limit(1000); // 最多查询1000条
+
+  const submissions = await submissionQuery.find();
+
+  // 4. 将查询结果处理成一个 "localId: status" 的映射
+  const statuses = {};
+  for (const submission of submissions) {
+    statuses[submission.get('localId')] = submission.get('status');
+  }
+
+  return statuses;
 });
 // --- ^^^ 以上是所有需要添加的代码 ^^^ ---
