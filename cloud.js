@@ -1,4 +1,4 @@
-// cloud.js (最终正确版)
+// cloud.js (包含“一键发布”功能的最终完整版)
 
 'use strict';
 // 引入 LeanCloud SDK
@@ -60,7 +60,6 @@ AV.Cloud.define('toggleLikeCharacter', async (request) => {
 });
 
 // --- 函数 3: (核心) 获取七牛云上传凭证 (整合后的版本) ---
-// 我们将使用这个新版本，它从环境变量读取密钥，更安全
 AV.Cloud.define('getQiniuUploadToken', async (request) => {
   // 从环境变量中获取你的七牛云密钥
   const accessKey = process.env.QINIU_AK;
@@ -94,5 +93,75 @@ AV.Cloud.define('getQiniuUploadToken', async (request) => {
   }
 });
 
-// 注意：您之前硬编码密钥的 getQiniuToken 函数已被移除，
-// 因为 getQiniuUploadToken 是它的更安全、更正确的替代品。
+
+// --- vvv 函数 4: (新增) 一键发布已批准的角色 vvv ---
+/**
+ * [核心功能] 一键发布已批准的角色
+ * 1. 查找 CharacterSubmissions 表中所有 status 为 'approved' 的记录。
+ * 2. 获取当前 Character 表中最大的 ID，用于生成新 ID。
+ * 3. 遍历所有已批准的提交：
+ *    a. 在 Character 表中创建一个新角色。
+ *    b. 将提交记录的 status 更新为 'published'，防止重复发布。
+ * 4. 返回处理结果。
+ */
+AV.Cloud.define('publishApprovedCharacters', async (request) => {
+  // 1. 查询所有已批准的提交
+  const submissionQuery = new AV.Query('CharacterSubmissions');
+  submissionQuery.equalTo('status', 'approved');
+  const submissions = await submissionQuery.find();
+
+  if (submissions.length === 0) {
+    return '没有找到待发布的角色。';
+  }
+
+  // 2. 获取当前官方角色中的最大 ID
+  const charQuery = new AV.Query('Character');
+  charQuery.descending('id'); // 按 id 降序排序
+  charQuery.limit(1); // 只取最大的那一个
+  const maxIdChar = await charQuery.first();
+  let maxId = maxIdChar ? maxIdChar.get('id') : 0; // 如果表为空，则从 0 开始
+
+  let successCount = 0;
+  const failedSubmissions = [];
+
+  // 3. 遍历并发布每一个提交
+  for (const submission of submissions) {
+    try {
+      const submissionData = submission.get('characterData');
+      const imageUrl = submission.get('imageUrl');
+      const newId = ++maxId; // ID 递增
+
+      // 3a. 创建新角色对象并设置属性
+      const Character = AV.Object.extend('Character');
+      const newChar = new Character();
+      newChar.set('id', newId);
+      newChar.set('name', submissionData.name);
+      newChar.set('description', submissionData.description);
+      newChar.set('imageUrl', imageUrl); // 使用上传到七牛云的 URL
+      newChar.set('characterPrompt', submissionData.characterPrompt);
+      newChar.set('userProfilePrompt', submissionData.userProfilePrompt);
+      newChar.set('storyBackgroundPrompt', submissionData.storyBackgroundPrompt);
+      newChar.set('storyStartPrompt', submissionData.storyStartPrompt);
+      
+      // 使用 masterKey 保存，无视 ACL 限制
+      await newChar.save(null, { useMasterKey: true });
+
+      // 3b. 更新提交记录的状态为 'published'
+      submission.set('status', 'published');
+      await submission.save();
+
+      successCount++;
+    } catch (error) {
+      console.error(`发布角色失败，Submission ID: ${submission.id}, 错误:`, error);
+      failedSubmissions.push(submission.id);
+    }
+  }
+
+  // 4. 返回最终结果
+  let resultMessage = `发布完成！成功发布 ${successCount} 个角色。`;
+  if (failedSubmissions.length > 0) {
+    resultMessage += ` 失败 ${failedSubmissions.length} 个，ID: ${failedSubmissions.join(', ')}。请检查日志。`;
+  }
+  return resultMessage;
+});
+// --- ^^^ 以上是所有需要添加的代码 ^^^ ---
