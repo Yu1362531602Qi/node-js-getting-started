@@ -1,4 +1,4 @@
-// cloud.js (版本 3 - 最终版，包含旧头像自动清理功能)
+// cloud.js (最终版 - 包含用户专属的本地角色ID生成器)
 
 'use strict';
 // 引入 LeanCloud SDK
@@ -14,10 +14,10 @@ AV.Cloud.define('hello', function(request) {
 });
 
 
-// --- 用户头像管理 ---
+// --- 用户与个人资料 ---
 
 /**
- * [无变化] 获取用户头像上传到七牛云的凭证和文件Key
+ * 获取用户头像上传到七牛云的凭证和文件Key
  */
 AV.Cloud.define('getQiniuUserAvatarUploadToken', async (request) => {
   if (!request.currentUser) {
@@ -51,7 +51,7 @@ AV.Cloud.define('getQiniuUserAvatarUploadToken', async (request) => {
 });
 
 /**
- * [核心升级] 保存用户头像的URL，并自动删除旧头像
+ * 保存用户头像的URL，并自动删除旧头像
  */
 AV.Cloud.define('saveUserAvatarUrl', async (request) => {
   const currentUser = request.currentUser;
@@ -70,22 +70,16 @@ AV.Cloud.define('saveUserAvatarUrl', async (request) => {
       throw new AV.Cloud.Error('服务器配置错误，无法生成头像URL。', { code: 500 });
   }
 
-  // 1. 在更新数据库前，先获取旧的头像URL
   const oldAvatarUrl = currentUser.get('avatarUrl');
 
-  // 2. 更新数据库，保存新的头像URL
   const newAvatarUrl = `${bucketUrl}/${newKey}`;
   currentUser.set('avatarUrl', newAvatarUrl);
   await currentUser.save(null, { useMasterKey: true });
 
-  // 3. 【核心新增】如果存在旧头像，则执行删除操作
   if (oldAvatarUrl) {
     try {
-      // 从旧的URL中解析出旧的 key
       const oldKey = oldAvatarUrl.replace(bucketUrl + '/', '');
       
-      // 确保旧 key 不是新 key (防止意外删除刚上传的文件)
-      // 并且旧 key 必须在我们约定的文件夹内，防止删除其他文件
       if (oldKey && oldKey !== newKey && oldKey.startsWith('user_avatars/')) {
         console.log(`准备删除旧头像，Key: ${oldKey}`);
         
@@ -97,19 +91,14 @@ AV.Cloud.define('saveUserAvatarUrl', async (request) => {
         const config = new qiniu.conf.Config();
         const bucketManager = new qiniu.rs.BucketManager(mac, config);
 
-        // 使用 Promise 包装七牛云的删除回调函数
         await new Promise((resolve, reject) => {
           bucketManager.delete(bucket, oldKey, (err, respBody, respInfo) => {
             if (err) {
-              // 如果发生错误，拒绝 Promise
               reject(err);
             } else {
-              // 根据七牛云的响应状态码判断是否成功
               if (respInfo.statusCode == 200) {
                 resolve(respBody);
               } else {
-                // 即使是 612 (文件不存在) 也视为可接受的“成功”，因为目的已经达到
-                // 其他错误则拒绝
                 if (respInfo.statusCode !== 612) {
                    reject(new Error(`删除失败，状态码: ${respInfo.statusCode}, 信息: ${JSON.stringify(respBody)}`));
                 } else {
@@ -123,18 +112,43 @@ AV.Cloud.define('saveUserAvatarUrl', async (request) => {
         console.log(`成功删除旧头像: ${oldKey}`);
       }
     } catch (e) {
-      // 删除旧头像失败不应阻塞主流程，只在后台记录错误
       console.error(`删除旧头像(URL: ${oldAvatarUrl})时发生错误:`, e);
     }
   }
 
-  // 4. 无论旧头像删除是否成功，都向客户端返回成功信息和新URL
   return { success: true, avatarUrl: newAvatarUrl };
 });
 
 
-// --- 角色和提交管理 (保留原有功能，无变化) ---
+// --- 角色与创作管理 ---
 
+/**
+ * [核心新增] 为当前用户生成一个永不重复的、用于本地创作的ID
+ * @returns {number} 一个新的、唯一的负整数ID
+ */
+AV.Cloud.define('generateNewLocalCharacterId', async (request) => {
+  const user = request.currentUser;
+  if (!user) {
+    throw new AV.Cloud.Error('用户未登录，无法生成ID。', { code: 401 });
+  }
+
+  // 使用原子性的 increment 操作，将计数器减 1
+  // 'fetchWhenSave: true' 确保操作完成后返回更新后的 user 对象
+  const updatedUser = await user.increment('localCharIdCounter', -1).save(null, {
+    fetchWhenSave: true,
+    useMasterKey: true // 确保有权限写入 _User 表
+  });
+
+  // 从更新后的 user 对象中获取新的计数值
+  const newId = updatedUser.get('localCharIdCounter');
+
+  // 返回这个新ID给客户端
+  return newId;
+});
+
+/**
+ * 切换用户对某个角色的喜欢状态
+ */
 AV.Cloud.define('toggleLikeCharacter', async (request) => {
   const user = request.currentUser;
   if (!user) {
@@ -156,6 +170,9 @@ AV.Cloud.define('toggleLikeCharacter', async (request) => {
   return likedIds;
 });
 
+/**
+ * 获取角色图片上传到七牛云的凭证
+ */
 AV.Cloud.define('getQiniuUploadToken', async (request) => {
   const accessKey = process.env.QINIU_AK;
   const secretKey = process.env.QINIU_SK;
@@ -181,7 +198,43 @@ AV.Cloud.define('getQiniuUploadToken', async (request) => {
   }
 });
 
+/**
+ * 获取用户提交的角色的审核状态
+ */
+AV.Cloud.define('getSubmissionStatuses', async (request) => {
+  const user = request.currentUser;
+  if (!user) {
+    throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
+  }
+  const { localIds } = request.params;
+  if (!Array.isArray(localIds) || localIds.length === 0) {
+    return {};
+  }
+  const submissionQuery = new AV.Query('CharacterSubmissions');
+  submissionQuery.equalTo('submitter', user);
+  submissionQuery.containedIn('localId', localIds); 
+  submissionQuery.select(['localId', 'status']);
+  submissionQuery.limit(1000);
+  const submissions = await submissionQuery.find();
+  const statuses = {};
+  for (const submission of submissions) {
+    statuses[submission.get('localId')] = submission.get('status');
+  }
+  return statuses;
+});
+
+
+// --- 管理员后台功能 ---
+
+/**
+ * [管理员] 发布所有已批准的角色
+ */
 AV.Cloud.define('publishApprovedCharacters', async (request) => {
+  // TODO: 在生产环境中，应添加管理员权限校验
+  // if (!request.currentUser || !request.currentUser.get('isAdmin')) {
+  //   throw new AV.Cloud.Error('无权操作。', { code: 403 });
+  // }
+
   const submissionQuery = new AV.Query('CharacterSubmissions');
   submissionQuery.equalTo('status', 'approved');
   const submissions = await submissionQuery.find();
@@ -224,26 +277,4 @@ AV.Cloud.define('publishApprovedCharacters', async (request) => {
     resultMessage += ` 失败 ${failedSubmissions.length} 个，ID: ${failedSubmissions.join(', ')}。请检查日志。`;
   }
   return resultMessage;
-});
-
-AV.Cloud.define('getSubmissionStatuses', async (request) => {
-  const user = request.currentUser;
-  if (!user) {
-    throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
-  }
-  const { localIds } = request.params;
-  if (!Array.isArray(localIds) || localIds.length === 0) {
-    return {};
-  }
-  const submissionQuery = new AV.Query('CharacterSubmissions');
-  submissionQuery.equalTo('submitter', user);
-  submissionQuery.containedIn('localId', localIds); 
-  submissionQuery.select(['localId', 'status']);
-  submissionQuery.limit(1000);
-  const submissions = await submissionQuery.find();
-  const statuses = {};
-  for (const submission of submissions) {
-    statuses[submission.get('localId')] = submission.get('status');
-  }
-  return statuses;
 });
