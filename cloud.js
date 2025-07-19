@@ -1,4 +1,4 @@
-// cloud.js (已集成关注/粉丝列表功能)
+// cloud.js (已集成发布时绑定作者功能)
 
 'use strict';
 const AV = require('leanengine');
@@ -158,61 +158,39 @@ AV.Cloud.define('unfollowUser', async (request) => {
   return { success: true, message: '取消关注成功' };
 });
 
-// --- vvv 核心新增：获取关注/粉丝列表的云函数 vvv ---
-
-/**
- * 获取一个用户的粉丝列表（谁关注了他）
- * @param {string} targetUserId - 目标用户的 objectId
- * @param {number} page - 页码，从1开始
- * @param {number} limit - 每页数量
- */
 AV.Cloud.define('getFollowers', async (request) => {
   const { targetUserId, page = 1, limit = 20 } = request.params;
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
   }
-
   const targetUser = AV.Object.createWithoutData('_User', targetUserId);
   const query = new AV.Query('Follow');
-  query.equalTo('followed', targetUser); // 查询 Follow 表中 'followed' 字段是目标用户的记录
-  query.include('user'); // 关键：同时把 'user' 字段（粉丝）的完整信息带回来
-  query.select('user.username', 'user.avatarUrl', 'user.objectId'); // 只选择需要的字段
+  query.equalTo('followed', targetUser);
+  query.include('user');
+  query.select('user.username', 'user.avatarUrl', 'user.objectId');
   query.skip((page - 1) * limit);
   query.limit(limit);
   query.descending('createdAt');
-
   const results = await query.find();
-  // 提取粉丝的用户信息并返回
   return results.map(follow => follow.get('user'));
 });
 
-/**
- * 获取一个用户的关注列表（他关注了谁）
- * @param {string} targetUserId - 目标用户的 objectId
- * @param {number} page - 页码，从1开始
- * @param {number} limit - 每页数量
- */
 AV.Cloud.define('getFollowing', async (request) => {
   const { targetUserId, page = 1, limit = 20 } = request.params;
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
   }
-
   const targetUser = AV.Object.createWithoutData('_User', targetUserId);
   const query = new AV.Query('Follow');
-  query.equalTo('user', targetUser); // 查询 Follow 表中 'user' 字段是目标用户的记录
-  query.include('followed'); // 关键：同时把 'followed' 字段（被关注者）的完整信息带回来
-  query.select('followed.username', 'followed.avatarUrl', 'followed.objectId'); // 只选择需要的字段
+  query.equalTo('user', targetUser);
+  query.include('followed');
+  query.select('followed.username', 'followed.avatarUrl', 'followed.objectId');
   query.skip((page - 1) * limit);
   query.limit(limit);
   query.descending('createdAt');
-
   const results = await query.find();
-  // 提取被关注者的用户信息并返回
   return results.map(follow => follow.get('followed'));
 });
-
-// --- ^^^ 核心新增 ^^^ ---
 
 
 // --- 角色与创作管理 ---
@@ -339,27 +317,36 @@ AV.Cloud.define('searchPublicContent', async (request) => {
 
 // --- 管理员后台功能 ---
 
+// --- vvv 核心修改：发布角色时，增加作者信息 vvv ---
 AV.Cloud.define('publishApprovedCharacters', async (request) => {
   const submissionQuery = new AV.Query('CharacterSubmissions');
   submissionQuery.equalTo('status', 'approved');
+  submissionQuery.include('submitter'); // 关键：把提交者的完整信息带出来
   const submissions = await submissionQuery.find();
+
   if (submissions.length === 0) {
     return '没有找到待发布的角色。';
   }
+
   const charQuery = new AV.Query('Character');
   charQuery.descending('id');
   charQuery.limit(1);
   const maxIdChar = await charQuery.first();
   let maxId = maxIdChar ? maxIdChar.get('id') : 0;
+
   let successCount = 0;
   const failedSubmissions = [];
+
   for (const submission of submissions) {
     try {
       const submissionData = submission.get('characterData');
       const imageUrl = submission.get('imageUrl');
+      const submitter = submission.get('submitter'); // 获取提交者对象
+
       const newId = ++maxId;
       const Character = AV.Object.extend('Character');
       const newChar = new Character();
+
       newChar.set('id', newId);
       newChar.set('name', submissionData.name);
       newChar.set('description', submissionData.description);
@@ -368,6 +355,14 @@ AV.Cloud.define('publishApprovedCharacters', async (request) => {
       newChar.set('userProfilePrompt', submissionData.userProfilePrompt);
       newChar.set('storyBackgroundPrompt', submissionData.storyBackgroundPrompt);
       newChar.set('storyStartPrompt', submissionData.storyStartPrompt);
+      
+      // --- vvv 核心新增：设置作者信息 vvv ---
+      if (submitter) {
+        newChar.set('author', submitter); // Pointer to _User
+        newChar.set('authorName', submitter.get('username')); // String
+      }
+      // --- ^^^ 核心新增 ^^^ ---
+
       await newChar.save(null, { useMasterKey: true });
       submission.set('status', 'published');
       await submission.save();
@@ -383,6 +378,7 @@ AV.Cloud.define('publishApprovedCharacters', async (request) => {
   }
   return resultMessage;
 });
+// --- ^^^ 核心修改 ^^^ ---
 
 AV.Cloud.define('getUserPublicProfile', async (request) => {
   const { userId } = request.params;
