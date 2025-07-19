@@ -213,10 +213,7 @@ AV.Cloud.define('getFollowers', async (request) => {
   const targetUser = AV.Object.createWithoutData('_User', userId);
   const query = new AV.Query('Follow');
   query.equalTo('following', targetUser);
-  query.include('follower'); // 关键：同时把粉丝的用户数据也查询出来
-  // --- vvv 核心修正：删除冲突的 .select() 指令 vvv ---
-  // query.select('follower');   // <-- 删除此行
-  // --- ^^^ 核心修正 ^^^ ---
+  query.include('follower'); 
   query.descending('createdAt');
   query.skip((page - 1) * limit);
   query.limit(limit);
@@ -224,7 +221,10 @@ AV.Cloud.define('getFollowers', async (request) => {
   const results = await query.find();
   const users = results.map(r => r.get('follower'));
 
-  return await _attachFollowStatus(request.currentUser, users);
+  const finalResult = await _attachFollowStatus(request.currentUser, users);
+  // --- 调试日志 ---
+  console.log(`[getFollowers] for user ${userId}, page ${page}, returning ${finalResult.length} users.`);
+  return finalResult;
 });
 
 /**
@@ -241,10 +241,7 @@ AV.Cloud.define('getFollowing', async (request) => {
   const targetUser = AV.Object.createWithoutData('_User', userId);
   const query = new AV.Query('Follow');
   query.equalTo('follower', targetUser);
-  query.include('following'); // 关键：同时把被关注者的用户数据也查询出来
-  // --- vvv 核心修正：删除冲突的 .select() 指令 vvv ---
-  // query.select('following');    // <-- 删除此行
-  // --- ^^^ 核心修正 ^^^ ---
+  query.include('following');
   query.descending('createdAt');
   query.skip((page - 1) * limit);
   query.limit(limit);
@@ -252,7 +249,10 @@ AV.Cloud.define('getFollowing', async (request) => {
   const results = await query.find();
   const users = results.map(r => r.get('following'));
 
-  return await _attachFollowStatus(request.currentUser, users);
+  const finalResult = await _attachFollowStatus(request.currentUser, users);
+  // --- 调试日志 ---
+  console.log(`[getFollowing] for user ${userId}, page ${page}, returning ${finalResult.length} users.`);
+  return finalResult;
 });
 
 /**
