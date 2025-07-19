@@ -1,3 +1,5 @@
+// lib/cloud.js
+
 // cloud.js (最终版 - 包含用户专属ID生成器和增强版全局搜索功能)
 
 'use strict';
@@ -118,6 +120,89 @@ AV.Cloud.define('saveUserAvatarUrl', async (request) => {
 
   return { success: true, avatarUrl: newAvatarUrl };
 });
+
+
+// --- vvv 核心新增：关注系统相关云函数 vvv ---
+
+/**
+ * 关注或取消关注一个用户
+ * @param {string} userId - 要关注或取关的用户的 objectId
+ * @returns {object} - { status: 'followed' | 'unfollowed' }
+ */
+AV.Cloud.define('toggleFollow', async (request) => {
+  const currentUser = request.currentUser;
+  if (!currentUser) {
+    throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
+  }
+
+  const { userId: targetUserId } = request.params;
+  if (!targetUserId) {
+    throw new AV.Cloud.Error('必须提供目标用户的 userId。', { code: 400 });
+  }
+  
+  if (currentUser.id === targetUserId) {
+    throw new AV.Cloud.Error('不能关注自己。', { code: 400 });
+  }
+
+  const follower = currentUser;
+  const following = AV.Object.createWithoutData('_User', targetUserId);
+
+  const query = new AV.Query('Follow');
+  query.equalTo('follower', follower);
+  query.equalTo('following', following);
+  const relation = await query.first();
+
+  if (relation) {
+    // 已关注，执行取关
+    await relation.destroy({ useMasterKey: true });
+    return { status: 'unfollowed' };
+  } else {
+    // 未关注，执行关注
+    const newFollow = new AV.Object('Follow');
+    newFollow.set('follower', follower);
+    newFollow.set('following', following);
+    
+    // 设置ACL，保证只有关注者自己能删除这个关系
+    const acl = new AV.ACL();
+    acl.setReadAccess(currentUser, true);
+    acl.setWriteAccess(currentUser, true);
+    acl.setPublicReadAccess(true); // 允许任何人读取，以便查询粉丝列表等
+    newFollow.setACL(acl);
+
+    await newFollow.save(null, { useMasterKey: true });
+    return { status: 'followed' };
+  }
+});
+
+/**
+ * 在 Follow 关系创建后，更新双方的计数器
+ */
+AV.Cloud.afterSave('Follow', async (request) => {
+  const follower = request.object.get('follower');
+  const following = request.object.get('following');
+
+  // 使用 MasterKey 来无视权限更新用户数据
+  await follower.increment('followingCount', 1).save(null, { useMasterKey: true });
+  await following.increment('followersCount', 1).save(null, { useMasterKey: true });
+  
+  console.log(`User ${follower.id} followed ${following.id}. Counts updated.`);
+});
+
+/**
+ * 在 Follow 关系删除后，更新双方的计数器
+ */
+AV.Cloud.afterDelete('Follow', async (request) => {
+  const follower = request.object.get('follower');
+  const following = request.object.get('following');
+
+  // 使用 MasterKey 来无视权限更新用户数据
+  await follower.increment('followingCount', -1).save(null, { useMasterKey: true });
+  await following.increment('followersCount', -1).save(null, { useMasterKey: true });
+
+  console.log(`User ${follower.id} unfollowed ${following.id}. Counts updated.`);
+});
+
+// --- ^^^ 核心新增 ^^^ ---
 
 
 // --- 角色与创作管理 ---
@@ -323,40 +408,53 @@ AV.Cloud.define('publishApprovedCharacters', async (request) => {
 });
 
 /**
- * [核心新增] 获取指定用户的公开主页信息
+ * [核心修改] 获取指定用户的公开主页信息 (增强版)
  * @param {string} userId - 要查询的用户的 objectId
  * @returns {object} 包含用户公开信息、统计数据和已发布作品列表的对象
  */
 AV.Cloud.define('getUserPublicProfile', async (request) => {
   const { userId } = request.params;
+  const currentUser = request.currentUser; // 获取当前登录用户
+
   if (!userId) {
     throw new AV.Cloud.Error('必须提供 userId 参数。', { code: 400 });
   }
 
   // 1. 查询用户基本信息
   const userQuery = new AV.Query('_User');
-  userQuery.select(['username', 'avatarUrl', 'objectId']); // 只选择公开字段
+  // --- vvv 核心修改: 同时查询计数器字段 vvv ---
+  userQuery.select(['username', 'avatarUrl', 'objectId', 'followingCount', 'followersCount']);
+  // --- ^^^ 核心修改 ^^^ ---
   const user = await userQuery.get(userId);
 
   if (!user) {
     throw new AV.Cloud.Error('用户不存在。', { code: 404 });
   }
 
+  // --- vvv 核心新增: 查询当前登录用户是否关注了该主页用户 vvv ---
+  let isFollowing = false;
+  if (currentUser && currentUser.id !== userId) {
+    const followQuery = new AV.Query('Follow');
+    followQuery.equalTo('follower', currentUser);
+    followQuery.equalTo('following', user);
+    const followRelation = await followQuery.first();
+    if (followRelation) {
+      isFollowing = true;
+    }
+  }
+  // --- ^^^ 核心新增 ^^^ ---
+
   // 2. 查询该用户已发布的作品
-  // 注意：这里我们查询 CharacterSubmissions 表，因为 Character 表没有直接关联创建者
-  // 这是一个简化的实现，未来可以优化为直接在 Character 表中存储创建者指针
   const creationsQuery = new AV.Query('CharacterSubmissions');
   creationsQuery.equalTo('submitter', AV.Object.createWithoutData('_User', userId));
-  creationsQuery.equalTo('status', 'published'); // 只查找已发布的作品
-  creationsQuery.descending('createdAt'); // 按创建时间降序
-  creationsQuery.limit(50); // 最多返回50个作品
+  creationsQuery.equalTo('status', 'published');
+  creationsQuery.descending('createdAt');
+  creationsQuery.limit(50);
   const submissions = await creationsQuery.find();
 
-  // 格式化作品数据，使其符合客户端 Character 模型的结构
   const creations = submissions.map(sub => {
     const charData = sub.get('characterData');
     return {
-      // 使用 localId 作为唯一标识，因为发布的 Character ID 客户端不知道
       id: sub.get('localId'), 
       name: charData.name,
       description: charData.description,
@@ -369,18 +467,18 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
     };
   });
 
-  // 3. 查询统计数据 (目前为占位符)
-  // TODO: 未来实现关注系统后，在这里查询真实的关注数和粉丝数
-  const stats = {
-    following: 0,
-    followers: 0,
-    likesReceived: 0, // TODO: 获赞数也需要单独统计
-  };
-
-  // 4. 组合并返回所有数据
+  // 3. 组合并返回所有数据
+  const userJSON = user.toJSON();
+  // --- vvv 核心修改: 将 isFollowing 状态和获赞数(占位)加入返回结果 vvv ---
   return {
-    user: user.toJSON(),
+    user: userJSON,
     creations: creations,
-    stats: stats,
+    stats: {
+      following: userJSON.followingCount || 0,
+      followers: userJSON.followersCount || 0,
+      likesReceived: 0, // TODO: 获赞数也需要单独统计
+    },
+    isFollowing: isFollowing, // 将关注状态返回给客户端
   };
+  // --- ^^^ 核心修改 ^^^ ---
 });
