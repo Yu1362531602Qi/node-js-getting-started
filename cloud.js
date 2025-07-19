@@ -1,5 +1,3 @@
-// lib/cloud.js
-
 // cloud.js (最终版 - 包含用户专属ID生成器和增强版全局搜索功能)
 
 'use strict';
@@ -120,168 +118,6 @@ AV.Cloud.define('saveUserAvatarUrl', async (request) => {
 
   return { success: true, avatarUrl: newAvatarUrl };
 });
-
-
-// --- 关注系统 ---
-
-/**
- * 关注或取消关注一个用户
- * @param {string} userId - 要关注或取关的用户的 objectId
- * @returns {object} - { status: 'followed' | 'unfollowed' }
- */
-AV.Cloud.define('toggleFollow', async (request) => {
-  const currentUser = request.currentUser;
-  if (!currentUser) {
-    throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
-  }
-
-  const { userId: targetUserId } = request.params;
-  if (!targetUserId) {
-    throw new AV.Cloud.Error('必须提供目标用户的 userId。', { code: 400 });
-  }
-  
-  if (currentUser.id === targetUserId) {
-    throw new AV.Cloud.Error('不能关注自己。', { code: 400 });
-  }
-
-  const follower = currentUser;
-  const following = AV.Object.createWithoutData('_User', targetUserId);
-
-  const query = new AV.Query('Follow');
-  query.equalTo('follower', follower);
-  query.equalTo('following', following);
-  const relation = await query.first();
-
-  if (relation) {
-    // 已关注，执行取关
-    await relation.destroy({ useMasterKey: true });
-    return { status: 'unfollowed' };
-  } else {
-    // 未关注，执行关注
-    const newFollow = new AV.Object('Follow');
-    newFollow.set('follower', follower);
-    newFollow.set('following', following);
-    
-    const acl = new AV.ACL();
-    acl.setReadAccess(currentUser, true);
-    acl.setWriteAccess(currentUser, true);
-    acl.setPublicReadAccess(true);
-    newFollow.setACL(acl);
-
-    await newFollow.save(null, { useMasterKey: true });
-    return { status: 'followed' };
-  }
-});
-
-/**
- * 在 Follow 关系创建后，更新双方的计数器
- */
-AV.Cloud.afterSave('Follow', async (request) => {
-  const follower = request.object.get('follower');
-  const following = request.object.get('following');
-
-  await follower.increment('followingCount', 1).save(null, { useMasterKey: true });
-  await following.increment('followersCount', 1).save(null, { useMasterKey: true });
-  
-  console.log(`User ${follower.id} followed ${following.id}. Counts updated.`);
-});
-
-/**
- * 在 Follow 关系删除后，更新双方的计数器
- */
-AV.Cloud.afterDelete('Follow', async (request) => {
-  const follower = request.object.get('follower');
-  const following = request.object.get('following');
-
-  await follower.increment('followingCount', -1).save(null, { useMasterKey: true });
-  await following.increment('followersCount', -1).save(null, { useMasterKey: true });
-
-  console.log(`User ${follower.id} unfollowed ${following.id}. Counts updated.`);
-});
-
-/**
- * 获取一个用户的粉丝列表（谁关注了 ta）
- * @param {string} userId - 目标用户的 objectId
- * @param {number} page - 页码 (从1开始)
- * @param {number} limit - 每页数量
- * @returns {Array<User>} - 用户对象列表
- */
-AV.Cloud.define('getFollowers', async (request) => {
-  const { userId, page = 1, limit = 20 } = request.params;
-  if (!userId) throw new AV.Cloud.Error('必须提供 userId。', { code: 400 });
-
-  const targetUser = AV.Object.createWithoutData('_User', userId);
-  const query = new AV.Query('Follow');
-  query.equalTo('following', targetUser);
-  query.include('follower'); 
-  query.descending('createdAt');
-  query.skip((page - 1) * limit);
-  query.limit(limit);
-
-  const results = await query.find();
-  const users = results.map(r => r.get('follower'));
-
-  const finalResult = await _attachFollowStatus(request.currentUser, users);
-  // --- 调试日志 ---
-  console.log(`[getFollowers] for user ${userId}, page ${page}, returning ${finalResult.length} users.`);
-  return finalResult;
-});
-
-/**
- * 获取一个用户的关注列表（ta 关注了谁）
- * @param {string} userId - 目标用户的 objectId
- * @param {number} page - 页码 (从1开始)
- * @param {number} limit - 每页数量
- * @returns {Array<User>} - 用户对象列表
- */
-AV.Cloud.define('getFollowing', async (request) => {
-  const { userId, page = 1, limit = 20 } = request.params;
-  if (!userId) throw new AV.Cloud.Error('必须提供 userId。', { code: 400 });
-
-  const targetUser = AV.Object.createWithoutData('_User', userId);
-  const query = new AV.Query('Follow');
-  query.equalTo('follower', targetUser);
-  query.include('following');
-  query.descending('createdAt');
-  query.skip((page - 1) * limit);
-  query.limit(limit);
-
-  const results = await query.find();
-  const users = results.map(r => r.get('following'));
-
-  const finalResult = await _attachFollowStatus(request.currentUser, users);
-  // --- 调试日志 ---
-  console.log(`[getFollowing] for user ${userId}, page ${page}, returning ${finalResult.length} users.`);
-  return finalResult;
-});
-
-/**
- * 内部辅助函数：为用户列表附加“当前登录用户是否关注了他们”的状态
- * @param {User} currentUser - 当前登录的用户对象
- * @param {Array<User>} users - 需要处理的用户列表
- * @returns {Array<User>} - 附加了 isFollowedByMe 字段的用户列表
- */
-async function _attachFollowStatus(currentUser, users) {
-  if (!currentUser || users.length === 0) {
-    return users.map(u => ({ ...u.toJSON(), isFollowedByMe: false }));
-  }
-
-  const userPointers = users.map(u => AV.Object.createWithoutData('_User', u.id));
-
-  const followQuery = new AV.Query('Follow');
-  followQuery.equalTo('follower', currentUser);
-  followQuery.containedIn('following', userPointers);
-  followQuery.select('following.objectId');
-  const followedRelations = await followQuery.find({ useMasterKey: true });
-
-  const followedIds = new Set(followedRelations.map(r => r.get('following').id));
-
-  return users.map(u => {
-    const userJSON = u.toJSON();
-    userJSON.isFollowedByMe = followedIds.has(u.id);
-    return userJSON;
-  });
-}
 
 
 // --- 角色与创作管理 ---
@@ -487,49 +323,40 @@ AV.Cloud.define('publishApprovedCharacters', async (request) => {
 });
 
 /**
- * [核心修改] 获取指定用户的公开主页信息 (增强版)
+ * [核心新增] 获取指定用户的公开主页信息
  * @param {string} userId - 要查询的用户的 objectId
  * @returns {object} 包含用户公开信息、统计数据和已发布作品列表的对象
  */
 AV.Cloud.define('getUserPublicProfile', async (request) => {
   const { userId } = request.params;
-  const currentUser = request.currentUser; // 获取当前登录用户
-
   if (!userId) {
     throw new AV.Cloud.Error('必须提供 userId 参数。', { code: 400 });
   }
 
   // 1. 查询用户基本信息
   const userQuery = new AV.Query('_User');
-  userQuery.select(['username', 'avatarUrl', 'objectId', 'followingCount', 'followersCount']);
+  userQuery.select(['username', 'avatarUrl', 'objectId']); // 只选择公开字段
   const user = await userQuery.get(userId);
 
   if (!user) {
     throw new AV.Cloud.Error('用户不存在。', { code: 404 });
   }
 
-  let isFollowing = false;
-  if (currentUser && currentUser.id !== userId) {
-    const followQuery = new AV.Query('Follow');
-    followQuery.equalTo('follower', currentUser);
-    followQuery.equalTo('following', user);
-    const followRelation = await followQuery.first();
-    if (followRelation) {
-      isFollowing = true;
-    }
-  }
-
   // 2. 查询该用户已发布的作品
+  // 注意：这里我们查询 CharacterSubmissions 表，因为 Character 表没有直接关联创建者
+  // 这是一个简化的实现，未来可以优化为直接在 Character 表中存储创建者指针
   const creationsQuery = new AV.Query('CharacterSubmissions');
   creationsQuery.equalTo('submitter', AV.Object.createWithoutData('_User', userId));
-  creationsQuery.equalTo('status', 'published');
-  creationsQuery.descending('createdAt');
-  creationsQuery.limit(50);
+  creationsQuery.equalTo('status', 'published'); // 只查找已发布的作品
+  creationsQuery.descending('createdAt'); // 按创建时间降序
+  creationsQuery.limit(50); // 最多返回50个作品
   const submissions = await creationsQuery.find();
 
+  // 格式化作品数据，使其符合客户端 Character 模型的结构
   const creations = submissions.map(sub => {
     const charData = sub.get('characterData');
     return {
+      // 使用 localId 作为唯一标识，因为发布的 Character ID 客户端不知道
       id: sub.get('localId'), 
       name: charData.name,
       description: charData.description,
@@ -542,16 +369,18 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
     };
   });
 
-  // 3. 组合并返回所有数据
-  const userJSON = user.toJSON();
+  // 3. 查询统计数据 (目前为占位符)
+  // TODO: 未来实现关注系统后，在这里查询真实的关注数和粉丝数
+  const stats = {
+    following: 0,
+    followers: 0,
+    likesReceived: 0, // TODO: 获赞数也需要单独统计
+  };
+
+  // 4. 组合并返回所有数据
   return {
-    user: userJSON,
+    user: user.toJSON(),
     creations: creations,
-    stats: {
-      following: userJSON.followingCount || 0,
-      followers: userJSON.followersCount || 0,
-      likesReceived: 0, // TODO: 获赞数也需要单独统计
-    },
-    isFollowing: isFollowing,
+    stats: stats,
   };
 });
