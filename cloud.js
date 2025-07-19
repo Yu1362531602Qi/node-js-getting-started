@@ -1,4 +1,4 @@
-// cloud.js (最终版 - 包含用户专属ID生成器和全局搜索功能)
+// cloud.js (最终版 - 包含用户专属ID生成器和增强版全局搜索功能)
 
 'use strict';
 // 引入 LeanCloud SDK
@@ -222,7 +222,7 @@ AV.Cloud.define('getSubmissionStatuses', async (request) => {
 // --- 搜索功能 ---
 
 /**
- * 全局搜索功能，可同时搜索角色和用户
+ * 全局搜索功能，可同时搜索角色、用户和标签
  * @param {string} searchText - 用户输入的搜索关键词
  * @returns {object} 包含 'characters' 和 'users' 两个数组的搜索结果
  */
@@ -239,7 +239,10 @@ AV.Cloud.define('searchPublicContent', async (request) => {
   const characterDescQuery = new AV.Query('Character');
   characterDescQuery.contains('description', searchText);
 
-  const characterQuery = AV.Query.or(characterNameQuery, characterDescQuery);
+  const characterTagQuery = new AV.Query('Character');
+  characterTagQuery.equalTo('tags', searchText); 
+
+  const characterQuery = AV.Query.or(characterNameQuery, characterDescQuery, characterTagQuery);
   characterQuery.limit(20);
 
   const usernameQuery = new AV.Query('_User');
