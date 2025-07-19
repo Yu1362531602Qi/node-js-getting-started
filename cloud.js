@@ -1,14 +1,9 @@
-// cloud.js (最终版 - 包含用户专属ID生成器和增强版全局搜索功能)
+// cloud.js (已集成关注/粉丝系统)
 
 'use strict';
-// 引入 LeanCloud SDK
 const AV = require('leanengine');
-// 引入七牛云 SDK
 const qiniu = require('qiniu');
 
-/**
- * 一个简单的云代码方法 (模板自带，保留)
- */
 AV.Cloud.define('hello', function(request) {
   return 'Hello world!';
 });
@@ -16,24 +11,18 @@ AV.Cloud.define('hello', function(request) {
 
 // --- 用户与个人资料 ---
 
-/**
- * 获取用户头像上传到七牛云的凭证和文件Key
- */
 AV.Cloud.define('getQiniuUserAvatarUploadToken', async (request) => {
   if (!request.currentUser) {
     throw new AV.Cloud.Error('用户未登录，禁止获取上传凭证。', { code: 401 });
   }
   const userId = request.currentUser.id;
-
   const accessKey = process.env.QINIU_AK;
   const secretKey = process.env.QINIU_SK;
   const bucket = process.env.QINIU_BUCKET_NAME;
-
   if (!accessKey || !secretKey || !bucket) {
     console.error('七牛云环境变量未完全设置 (QINIU_AK, QINIU_SK, QINIU_BUCKET_NAME)');
     throw new AV.Cloud.Error('服务器配置错误，无法生成上传凭证。', { code: 500 });
   }
-
   const key = `user_avatars/${userId}/${Date.now()}.jpg`;
   const mac = new qiniu.auth.digest.Mac(accessKey, secretKey);
   const options = {
@@ -42,7 +31,6 @@ AV.Cloud.define('getQiniuUserAvatarUploadToken', async (request) => {
   };
   const putPolicy = new qiniu.rs.PutPolicy(options);
   const uploadToken = putPolicy.uploadToken(mac);
-
   if (uploadToken) {
     return { token: uploadToken, key: key };
   } else {
@@ -50,47 +38,35 @@ AV.Cloud.define('getQiniuUserAvatarUploadToken', async (request) => {
   }
 });
 
-/**
- * 保存用户头像的URL，并自动删除旧头像
- */
 AV.Cloud.define('saveUserAvatarUrl', async (request) => {
   const currentUser = request.currentUser;
   if (!currentUser) {
     throw new AV.Cloud.Error('用户未登录，无法更新头像。', { code: 401 });
   }
-
   const { key: newKey } = request.params;
   if (!newKey) {
     throw new AV.Cloud.Error('缺少 key 参数。', { code: 400 });
   }
-
   const bucketUrl = process.env.QINIU_BUCKET_URL;
   if (!bucketUrl) {
       console.error('七牛云环境变量 QINIU_BUCKET_URL 未设置');
       throw new AV.Cloud.Error('服务器配置错误，无法生成头像URL。', { code: 500 });
   }
-
   const oldAvatarUrl = currentUser.get('avatarUrl');
-
   const newAvatarUrl = `${bucketUrl}/${newKey}`;
   currentUser.set('avatarUrl', newAvatarUrl);
   await currentUser.save(null, { useMasterKey: true });
-
   if (oldAvatarUrl) {
     try {
       const oldKey = oldAvatarUrl.replace(bucketUrl + '/', '');
-      
       if (oldKey && oldKey !== newKey && oldKey.startsWith('user_avatars/')) {
         console.log(`准备删除旧头像，Key: ${oldKey}`);
-        
         const accessKey = process.env.QINIU_AK;
         const secretKey = process.env.QINIU_SK;
         const bucket = process.env.QINIU_BUCKET_NAME;
-
         const mac = new qiniu.auth.digest.Mac(accessKey, secretKey);
         const config = new qiniu.conf.Config();
         const bucketManager = new qiniu.rs.BucketManager(mac, config);
-
         await new Promise((resolve, reject) => {
           bucketManager.delete(bucket, oldKey, (err, respBody, respInfo) => {
             if (err) {
@@ -115,35 +91,119 @@ AV.Cloud.define('saveUserAvatarUrl', async (request) => {
       console.error(`删除旧头像(URL: ${oldAvatarUrl})时发生错误:`, e);
     }
   }
-
   return { success: true, avatarUrl: newAvatarUrl };
 });
+
+// --- vvv 核心新增：关注/粉丝相关云函数 vvv ---
+
+/**
+ * 关注一个用户
+ * @param {string} targetUserId - 被关注用户的 objectId
+ */
+AV.Cloud.define('followUser', async (request) => {
+  const user = request.currentUser;
+  if (!user) {
+    throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
+  }
+  const { targetUserId } = request.params;
+  if (!targetUserId) {
+    throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
+  }
+  if (user.id === targetUserId) {
+    throw new AV.Cloud.Error('不能关注自己。', { code: 400 });
+  }
+
+  // 1. 检查是否已关注
+  const followQuery = new AV.Query('Follow');
+  followQuery.equalTo('user', user);
+  followQuery.equalTo('followed', AV.Object.createWithoutData('_User', targetUserId));
+  const existingFollow = await followQuery.first();
+
+  if (existingFollow) {
+    console.log(`用户 ${user.id} 已关注 ${targetUserId}，无需重复操作。`);
+    return { success: true, message: '已关注' };
+  }
+
+  // 2. 创建 Follow 记录
+  const Follow = AV.Object.extend('Follow');
+  const newFollow = new Follow();
+  newFollow.set('user', user); // 关注者
+  newFollow.set('followed', AV.Object.createWithoutData('_User', targetUserId)); // 被关注者
+  
+  // 设置ACL，只有关注者自己可以读写/删除
+  const acl = new AV.ACL();
+  acl.setReadAccess(user, true);
+  acl.setWriteAccess(user, true);
+  newFollow.setACL(acl);
+
+  await newFollow.save(null, { useMasterKey: true });
+
+  // 3. 更新双方的计数器（原子操作）
+  const followerUpdate = user.increment('followingCount', 1);
+  const followedUser = AV.Object.createWithoutData('_User', targetUserId);
+  const followedUpdate = followedUser.increment('followersCount', 1);
+
+  await AV.Object.saveAll([followerUpdate, followedUpdate], { useMasterKey: true });
+
+  return { success: true, message: '关注成功' };
+});
+
+/**
+ * 取消关注一个用户
+ * @param {string} targetUserId - 被取消关注用户的 objectId
+ */
+AV.Cloud.define('unfollowUser', async (request) => {
+  const user = request.currentUser;
+  if (!user) {
+    throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
+  }
+  const { targetUserId } = request.params;
+  if (!targetUserId) {
+    throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
+  }
+
+  // 1. 查找要删除的 Follow 记录
+  const followQuery = new AV.Query('Follow');
+  followQuery.equalTo('user', user);
+  followQuery.equalTo('followed', AV.Object.createWithoutData('_User', targetUserId));
+  const followRecord = await followQuery.first();
+
+  if (!followRecord) {
+    console.log(`用户 ${user.id} 未关注 ${targetUserId}，无需取消。`);
+    return { success: true, message: '未关注' };
+  }
+
+  // 2. 删除 Follow 记录
+  await followRecord.destroy({ useMasterKey: true });
+
+  // 3. 更新双方的计数器（原子操作）
+  const followerUpdate = user.increment('followingCount', -1);
+  const followedUser = AV.Object.createWithoutData('_User', targetUserId);
+  const followedUpdate = followedUser.increment('followersCount', -1);
+
+  await AV.Object.saveAll([followerUpdate, followedUpdate], { useMasterKey: true });
+
+  return { success: true, message: '取消关注成功' };
+});
+
+// --- ^^^ 核心新增 ^^^ ---
 
 
 // --- 角色与创作管理 ---
 
-/**
- * 为当前用户生成一个永不重复的、用于本地创作的ID
- * @returns {number} 一个新的、唯一的负整数ID
- */
 AV.Cloud.define('generateNewLocalCharacterId', async (request) => {
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，无法生成ID。', { code: 401 });
   }
-
   const updatedUser = await user.increment('localCharIdCounter', -1).save(null, {
     fetchWhenSave: true,
     useMasterKey: true
   });
-
   const newId = updatedUser.get('localCharIdCounter');
   return newId;
 });
 
-/**
- * 切换用户对某个角色的喜欢状态
- */
 AV.Cloud.define('toggleLikeCharacter', async (request) => {
   const user = request.currentUser;
   if (!user) {
@@ -165,9 +225,6 @@ AV.Cloud.define('toggleLikeCharacter', async (request) => {
   return likedIds;
 });
 
-/**
- * 获取角色图片上传到七牛云的凭证
- */
 AV.Cloud.define('getQiniuUploadToken', async (request) => {
   const accessKey = process.env.QINIU_AK;
   const secretKey = process.env.QINIU_SK;
@@ -193,9 +250,6 @@ AV.Cloud.define('getQiniuUploadToken', async (request) => {
   }
 });
 
-/**
- * 获取用户提交的角色的审核状态
- */
 AV.Cloud.define('getSubmissionStatuses', async (request) => {
   const user = request.currentUser;
   if (!user) {
@@ -221,46 +275,31 @@ AV.Cloud.define('getSubmissionStatuses', async (request) => {
 
 // --- 搜索功能 ---
 
-/**
- * 全局搜索功能，可同时搜索角色、用户和标签
- * @param {string} searchText - 用户输入的搜索关键词
- * @returns {object} 包含 'characters' 和 'users' 两个数组的搜索结果
- */
 AV.Cloud.define('searchPublicContent', async (request) => {
   const { searchText } = request.params;
-
   if (!searchText || searchText.trim().length < 1) {
     return { characters: [], users: [] };
   }
-
   const characterNameQuery = new AV.Query('Character');
   characterNameQuery.contains('name', searchText);
-
   const characterDescQuery = new AV.Query('Character');
   characterDescQuery.contains('description', searchText);
-
   const characterTagQuery = new AV.Query('Character');
   characterTagQuery.equalTo('tags', searchText); 
-
   const characterQuery = AV.Query.or(characterNameQuery, characterDescQuery, characterTagQuery);
   characterQuery.limit(20);
-
   const usernameQuery = new AV.Query('_User');
   usernameQuery.contains('username', searchText);
-
   const userIdQuery = new AV.Query('_User');
   userIdQuery.equalTo('objectId', searchText);
-
   const userQuery = AV.Query.or(usernameQuery, userIdQuery);
   userQuery.select(['username', 'avatarUrl', 'objectId']);
   userQuery.limit(10);
-
   try {
     const [characterResults, userResults] = await Promise.all([
       characterQuery.find(),
       userQuery.find()
     ]);
-
     return {
       characters: characterResults,
       users: userResults,
@@ -274,9 +313,6 @@ AV.Cloud.define('searchPublicContent', async (request) => {
 
 // --- 管理员后台功能 ---
 
-/**
- * [管理员] 发布所有已批准的角色
- */
 AV.Cloud.define('publishApprovedCharacters', async (request) => {
   const submissionQuery = new AV.Query('CharacterSubmissions');
   submissionQuery.equalTo('status', 'approved');
@@ -322,41 +358,41 @@ AV.Cloud.define('publishApprovedCharacters', async (request) => {
   return resultMessage;
 });
 
+// --- vvv 核心修改：增强版 getUserPublicProfile vvv ---
 /**
- * [核心新增] 获取指定用户的公开主页信息
+ * 获取指定用户的公开主页信息 (增强版)
  * @param {string} userId - 要查询的用户的 objectId
- * @returns {object} 包含用户公开信息、统计数据和已发布作品列表的对象
+ * @returns {object} 包含用户公开信息、统计数据、作品列表和当前用户的关注状态
  */
 AV.Cloud.define('getUserPublicProfile', async (request) => {
   const { userId } = request.params;
+  const currentUser = request.currentUser; // 获取当前登录用户
+
   if (!userId) {
     throw new AV.Cloud.Error('必须提供 userId 参数。', { code: 400 });
   }
 
   // 1. 查询用户基本信息
   const userQuery = new AV.Query('_User');
-  userQuery.select(['username', 'avatarUrl', 'objectId']); // 只选择公开字段
-  const user = await userQuery.get(userId);
+  // --- vvv 核心修改：增加查询计数器字段 vvv ---
+  userQuery.select(['username', 'avatarUrl', 'objectId', 'followingCount', 'followersCount']);
+  // --- ^^^ 核心修改 ^^^ ---
+  const user = await userQuery.get(userId, { useMasterKey: true }); // 使用 masterKey 读取计数
 
   if (!user) {
     throw new AV.Cloud.Error('用户不存在。', { code: 404 });
   }
 
   // 2. 查询该用户已发布的作品
-  // 注意：这里我们查询 CharacterSubmissions 表，因为 Character 表没有直接关联创建者
-  // 这是一个简化的实现，未来可以优化为直接在 Character 表中存储创建者指针
   const creationsQuery = new AV.Query('CharacterSubmissions');
   creationsQuery.equalTo('submitter', AV.Object.createWithoutData('_User', userId));
-  creationsQuery.equalTo('status', 'published'); // 只查找已发布的作品
-  creationsQuery.descending('createdAt'); // 按创建时间降序
-  creationsQuery.limit(50); // 最多返回50个作品
+  creationsQuery.equalTo('status', 'published');
+  creationsQuery.descending('createdAt');
+  creationsQuery.limit(50);
   const submissions = await creationsQuery.find();
-
-  // 格式化作品数据，使其符合客户端 Character 模型的结构
   const creations = submissions.map(sub => {
     const charData = sub.get('characterData');
     return {
-      // 使用 localId 作为唯一标识，因为发布的 Character ID 客户端不知道
       id: sub.get('localId'), 
       name: charData.name,
       description: charData.description,
@@ -369,18 +405,32 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
     };
   });
 
-  // 3. 查询统计数据 (目前为占位符)
-  // TODO: 未来实现关注系统后，在这里查询真实的关注数和粉丝数
+  // 3. 查询统计数据 (现在从用户对象直接获取)
   const stats = {
-    following: 0,
-    followers: 0,
-    likesReceived: 0, // TODO: 获赞数也需要单独统计
+    following: user.get('followingCount') || 0,
+    followers: user.get('followersCount') || 0,
+    likesReceived: 0, // TODO: 获赞数逻辑未来实现
   };
+
+  // --- vvv 核心新增：查询当前用户是否已关注该主页用户 vvv ---
+  let isFollowing = false;
+  if (currentUser && currentUser.id !== userId) {
+    const followQuery = new AV.Query('Follow');
+    followQuery.equalTo('user', currentUser);
+    followQuery.equalTo('followed', user);
+    const followRecord = await followQuery.first();
+    if (followRecord) {
+      isFollowing = true;
+    }
+  }
+  // --- ^^^ 核心新增 ^^^ ---
 
   // 4. 组合并返回所有数据
   return {
     user: user.toJSON(),
     creations: creations,
     stats: stats,
+    isFollowing: isFollowing, // 返回关注状态
   };
 });
+// --- ^^^ 核心修改 ^^^ ---
