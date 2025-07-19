@@ -1,4 +1,4 @@
-// cloud.js (已集成发布时绑定作者功能)
+// cloud.js (确保发布时包含 tags)
 
 'use strict';
 const AV = require('leanengine');
@@ -317,11 +317,10 @@ AV.Cloud.define('searchPublicContent', async (request) => {
 
 // --- 管理员后台功能 ---
 
-// --- vvv 核心修改：发布角色时，增加作者信息 vvv ---
 AV.Cloud.define('publishApprovedCharacters', async (request) => {
   const submissionQuery = new AV.Query('CharacterSubmissions');
   submissionQuery.equalTo('status', 'approved');
-  submissionQuery.include('submitter'); // 关键：把提交者的完整信息带出来
+  submissionQuery.include('submitter');
   const submissions = await submissionQuery.find();
 
   if (submissions.length === 0) {
@@ -341,7 +340,7 @@ AV.Cloud.define('publishApprovedCharacters', async (request) => {
     try {
       const submissionData = submission.get('characterData');
       const imageUrl = submission.get('imageUrl');
-      const submitter = submission.get('submitter'); // 获取提交者对象
+      const submitter = submission.get('submitter');
 
       const newId = ++maxId;
       const Character = AV.Object.extend('Character');
@@ -356,12 +355,14 @@ AV.Cloud.define('publishApprovedCharacters', async (request) => {
       newChar.set('storyBackgroundPrompt', submissionData.storyBackgroundPrompt);
       newChar.set('storyStartPrompt', submissionData.storyStartPrompt);
       
-      // --- vvv 核心新增：设置作者信息 vvv ---
+      // --- vvv 核心修改：确保 tags 被保存 vvv ---
+      newChar.set('tags', submissionData.tags || []); // 从提交数据中获取 tags
+      // --- ^^^ 核心修改 ^^^ ---
+      
       if (submitter) {
-        newChar.set('author', submitter); // Pointer to _User
-        newChar.set('authorName', submitter.get('username')); // String
+        newChar.set('author', submitter);
+        newChar.set('authorName', submitter.get('username'));
       }
-      // --- ^^^ 核心新增 ^^^ ---
 
       await newChar.save(null, { useMasterKey: true });
       submission.set('status', 'published');
@@ -378,7 +379,6 @@ AV.Cloud.define('publishApprovedCharacters', async (request) => {
   }
   return resultMessage;
 });
-// --- ^^^ 核心修改 ^^^ ---
 
 AV.Cloud.define('getUserPublicProfile', async (request) => {
   const { userId } = request.params;
