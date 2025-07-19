@@ -199,8 +199,6 @@ AV.Cloud.afterDelete('Follow', async (request) => {
   console.log(`User ${follower.id} unfollowed ${following.id}. Counts updated.`);
 });
 
-// --- vvv 核心新增：获取粉丝和关注列表的云函数 vvv ---
-
 /**
  * 获取一个用户的粉丝列表（谁关注了 ta）
  * @param {string} userId - 目标用户的 objectId
@@ -216,7 +214,9 @@ AV.Cloud.define('getFollowers', async (request) => {
   const query = new AV.Query('Follow');
   query.equalTo('following', targetUser);
   query.include('follower'); // 关键：同时把粉丝的用户数据也查询出来
-  query.select('follower');   // 只返回 follower 字段
+  // --- vvv 核心修正：删除冲突的 .select() 指令 vvv ---
+  // query.select('follower');   // <-- 删除此行
+  // --- ^^^ 核心修正 ^^^ ---
   query.descending('createdAt');
   query.skip((page - 1) * limit);
   query.limit(limit);
@@ -242,7 +242,9 @@ AV.Cloud.define('getFollowing', async (request) => {
   const query = new AV.Query('Follow');
   query.equalTo('follower', targetUser);
   query.include('following'); // 关键：同时把被关注者的用户数据也查询出来
-  query.select('following');    // 只返回 following 字段
+  // --- vvv 核心修正：删除冲突的 .select() 指令 vvv ---
+  // query.select('following');    // <-- 删除此行
+  // --- ^^^ 核心修正 ^^^ ---
   query.descending('createdAt');
   query.skip((page - 1) * limit);
   query.limit(limit);
@@ -280,8 +282,6 @@ async function _attachFollowStatus(currentUser, users) {
     return userJSON;
   });
 }
-
-// --- ^^^ 核心新增 ^^^ ---
 
 
 // --- 角色与创作管理 ---
