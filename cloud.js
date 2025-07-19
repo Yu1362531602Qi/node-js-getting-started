@@ -321,3 +321,66 @@ AV.Cloud.define('publishApprovedCharacters', async (request) => {
   }
   return resultMessage;
 });
+
+/**
+ * [核心新增] 获取指定用户的公开主页信息
+ * @param {string} userId - 要查询的用户的 objectId
+ * @returns {object} 包含用户公开信息、统计数据和已发布作品列表的对象
+ */
+AV.Cloud.define('getUserPublicProfile', async (request) => {
+  const { userId } = request.params;
+  if (!userId) {
+    throw new AV.Cloud.Error('必须提供 userId 参数。', { code: 400 });
+  }
+
+  // 1. 查询用户基本信息
+  const userQuery = new AV.Query('_User');
+  userQuery.select(['username', 'avatarUrl', 'objectId']); // 只选择公开字段
+  const user = await userQuery.get(userId);
+
+  if (!user) {
+    throw new AV.Cloud.Error('用户不存在。', { code: 404 });
+  }
+
+  // 2. 查询该用户已发布的作品
+  // 注意：这里我们查询 CharacterSubmissions 表，因为 Character 表没有直接关联创建者
+  // 这是一个简化的实现，未来可以优化为直接在 Character 表中存储创建者指针
+  const creationsQuery = new AV.Query('CharacterSubmissions');
+  creationsQuery.equalTo('submitter', AV.Object.createWithoutData('_User', userId));
+  creationsQuery.equalTo('status', 'published'); // 只查找已发布的作品
+  creationsQuery.descending('createdAt'); // 按创建时间降序
+  creationsQuery.limit(50); // 最多返回50个作品
+  const submissions = await creationsQuery.find();
+
+  // 格式化作品数据，使其符合客户端 Character 模型的结构
+  const creations = submissions.map(sub => {
+    const charData = sub.get('characterData');
+    return {
+      // 使用 localId 作为唯一标识，因为发布的 Character ID 客户端不知道
+      id: sub.get('localId'), 
+      name: charData.name,
+      description: charData.description,
+      imageUrl: sub.get('imageUrl'),
+      characterPrompt: charData.characterPrompt,
+      userProfilePrompt: charData.userProfilePrompt,
+      storyBackgroundPrompt: charData.storyBackgroundPrompt,
+      storyStartPrompt: charData.storyStartPrompt,
+      tags: charData.tags || [],
+    };
+  });
+
+  // 3. 查询统计数据 (目前为占位符)
+  // TODO: 未来实现关注系统后，在这里查询真实的关注数和粉丝数
+  const stats = {
+    following: 0,
+    followers: 0,
+    likesReceived: 0, // TODO: 获赞数也需要单独统计
+  };
+
+  // 4. 组合并返回所有数据
+  return {
+    user: user.toJSON(),
+    creations: creations,
+    stats: stats,
+  };
+});
