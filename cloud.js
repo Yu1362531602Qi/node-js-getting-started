@@ -1,4 +1,4 @@
-// cloud.js (最终版 - 包含用户专属的本地角色ID生成器)
+// cloud.js (最终版 - 包含用户专属ID生成器和全局搜索功能)
 
 'use strict';
 // 引入 LeanCloud SDK
@@ -123,7 +123,7 @@ AV.Cloud.define('saveUserAvatarUrl', async (request) => {
 // --- 角色与创作管理 ---
 
 /**
- * [核心新增] 为当前用户生成一个永不重复的、用于本地创作的ID
+ * 为当前用户生成一个永不重复的、用于本地创作的ID
  * @returns {number} 一个新的、唯一的负整数ID
  */
 AV.Cloud.define('generateNewLocalCharacterId', async (request) => {
@@ -132,17 +132,12 @@ AV.Cloud.define('generateNewLocalCharacterId', async (request) => {
     throw new AV.Cloud.Error('用户未登录，无法生成ID。', { code: 401 });
   }
 
-  // 使用原子性的 increment 操作，将计数器减 1
-  // 'fetchWhenSave: true' 确保操作完成后返回更新后的 user 对象
   const updatedUser = await user.increment('localCharIdCounter', -1).save(null, {
     fetchWhenSave: true,
-    useMasterKey: true // 确保有权限写入 _User 表
+    useMasterKey: true
   });
 
-  // 从更新后的 user 对象中获取新的计数值
   const newId = updatedUser.get('localCharIdCounter');
-
-  // 返回这个新ID给客户端
   return newId;
 });
 
@@ -224,17 +219,62 @@ AV.Cloud.define('getSubmissionStatuses', async (request) => {
 });
 
 
+// --- 搜索功能 ---
+
+/**
+ * 全局搜索功能，可同时搜索角色和用户
+ * @param {string} searchText - 用户输入的搜索关键词
+ * @returns {object} 包含 'characters' 和 'users' 两个数组的搜索结果
+ */
+AV.Cloud.define('searchPublicContent', async (request) => {
+  const { searchText } = request.params;
+
+  if (!searchText || searchText.trim().length < 1) {
+    return { characters: [], users: [] };
+  }
+
+  const characterNameQuery = new AV.Query('Character');
+  characterNameQuery.contains('name', searchText);
+
+  const characterDescQuery = new AV.Query('Character');
+  characterDescQuery.contains('description', searchText);
+
+  const characterQuery = AV.Query.or(characterNameQuery, characterDescQuery);
+  characterQuery.limit(20);
+
+  const usernameQuery = new AV.Query('_User');
+  usernameQuery.contains('username', searchText);
+
+  const userIdQuery = new AV.Query('_User');
+  userIdQuery.equalTo('objectId', searchText);
+
+  const userQuery = AV.Query.or(usernameQuery, userIdQuery);
+  userQuery.select(['username', 'avatarUrl', 'objectId']);
+  userQuery.limit(10);
+
+  try {
+    const [characterResults, userResults] = await Promise.all([
+      characterQuery.find(),
+      userQuery.find()
+    ]);
+
+    return {
+      characters: characterResults,
+      users: userResults,
+    };
+  } catch (error) {
+    console.error('搜索时发生错误:', error);
+    throw new AV.Cloud.Error('搜索失败，请稍后再试。', { code: 500 });
+  }
+});
+
+
 // --- 管理员后台功能 ---
 
 /**
  * [管理员] 发布所有已批准的角色
  */
 AV.Cloud.define('publishApprovedCharacters', async (request) => {
-  // TODO: 在生产环境中，应添加管理员权限校验
-  // if (!request.currentUser || !request.currentUser.get('isAdmin')) {
-  //   throw new AV.Cloud.Error('无权操作。', { code: 403 });
-  // }
-
   const submissionQuery = new AV.Query('CharacterSubmissions');
   submissionQuery.equalTo('status', 'approved');
   const submissions = await submissionQuery.find();
