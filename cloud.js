@@ -1,8 +1,19 @@
-// cloud.js (完整代码)
+// cloud.js (完整修正版)
 
 'use strict';
 const AV = require('leanengine');
 const qiniu = require('qiniu');
+
+// --- 辅助函数：检查用户是否为管理员 ---
+const isAdmin = async (user) => {
+  if (!user) return false;
+  const query = new AV.Query(AV.Role);
+  query.equalTo('name', 'Admin');
+  query.equalTo('users', user);
+  const count = await query.count({ useMasterKey: true });
+  return count > 0;
+};
+
 
 AV.Cloud.define('hello', function(request) {
   return 'Hello world!';
@@ -532,17 +543,14 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
   };
 });
 
-// --- 新增的管理员批量操作函数 ---
+// --- 管理员批量操作函数 ---
 
-/**
- * 预留一批连续的角色ID
- * @param {number} count - 需要预留的ID数量
- * @returns {object} - 包含起始ID和结束ID的对象, e.g., { startId: 50, endId: 69 }
- */
 AV.Cloud.define('reserveCharacterIds', async (request) => {
-  if (!request.currentUser || !(await request.currentUser.isInRole('Admin'))) {
+  // --- vvv 核心修正：使用新的 isAdmin 辅助函数 ---
+  if (!(await isAdmin(request.currentUser))) {
     throw new AV.Cloud.Error('权限不足，仅限管理员操作。', { code: 403 });
   }
+  // --- ^^^ 核心修正 ^^^ ---
 
   const { count } = request.params;
   if (typeof count !== 'number' || count <= 0 || count > 100) {
@@ -581,14 +589,12 @@ AV.Cloud.define('reserveCharacterIds', async (request) => {
   return { startId, endId };
 });
 
-/**
- * 批量添加官方角色卡 (使用预留好的ID)
- * @param {Array<Object>} charactersData - 角色信息数组，每个对象必须包含 id 字段
- */
 AV.Cloud.define('batchAddOfficialCharacters', async (request) => {
-  if (!request.currentUser || !(await request.currentUser.isInRole('Admin'))) {
+  // --- vvv 核心修正：使用新的 isAdmin 辅助函数 ---
+  if (!(await isAdmin(request.currentUser))) {
     throw new AV.Cloud.Error('权限不足，仅限管理员操作。', { code: 403 });
   }
+  // --- ^^^ 核心修正 ^^^ ---
 
   const { charactersData } = request.params;
   if (!Array.isArray(charactersData) || charactersData.length === 0) {
@@ -643,14 +649,12 @@ AV.Cloud.define('batchAddOfficialCharacters', async (request) => {
   return `操作成功！成功添加了 ${charactersToSave.length} 个官方角色。`;
 });
 
-/**
- * 批量删除角色及其在七牛云上的图片文件
- * @param {Array<number>} characterIds - 需要删除的 Character 表中的 id 数组
- */
 AV.Cloud.define('batchDeleteCharacters', async (request) => {
-  if (!request.currentUser || !(await request.currentUser.isInRole('Admin'))) {
+  // --- vvv 核心修正：使用新的 isAdmin 辅助函数 ---
+  if (!(await isAdmin(request.currentUser))) {
     throw new AV.Cloud.Error('权限不足，仅限管理员操作。', { code: 403 });
   }
+  // --- ^^^ 核心修正 ^^^ ---
 
   const { characterIds } = request.params;
   if (!Array.isArray(characterIds) || characterIds.length === 0) {
