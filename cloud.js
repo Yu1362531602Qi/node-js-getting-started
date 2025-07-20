@@ -1,4 +1,4 @@
-// cloud.js (确保发布时包含 tags)
+// cloud.js
 
 'use strict';
 const AV = require('leanengine');
@@ -208,6 +208,7 @@ AV.Cloud.define('generateNewLocalCharacterId', async (request) => {
   return newId;
 });
 
+// --- vvv 核心修改：增强 toggleLikeCharacter 函数 vvv ---
 AV.Cloud.define('toggleLikeCharacter', async (request) => {
   const user = request.currentUser;
   if (!user) {
@@ -217,17 +218,85 @@ AV.Cloud.define('toggleLikeCharacter', async (request) => {
   if (typeof characterId !== 'number') {
     throw new AV.Cloud.Error('参数 characterId 必须是一个数字。', { code: 400 });
   }
+
+  // 1. 查找对应的 Character 对象
+  const charQuery = new AV.Query('Character');
+  charQuery.equalTo('id', characterId);
+  const character = await charQuery.first({ useMasterKey: true });
+  if (!character) {
+    // 如果角色不存在，则只更新用户自己的列表，以处理本地角色或已删除角色的情况
+    console.warn(`未在 Character 表中找到 id 为 ${characterId} 的角色，将只更新用户喜欢列表。`);
+    const likedIds = user.get('likedCharacterIds') || [];
+    const index = likedIds.indexOf(characterId);
+    if (index > -1) {
+      likedIds.splice(index, 1);
+    } else {
+      likedIds.push(characterId);
+    }
+    user.set('likedCharacterIds', likedIds);
+    await user.save(null, { useMasterKey: true });
+    return likedIds;
+  }
+
+  // 2. 更新用户的 likedCharacterIds 数组
   const likedIds = user.get('likedCharacterIds') || [];
   const index = likedIds.indexOf(characterId);
+  let incrementAmount = 0;
+
   if (index > -1) {
+    // 如果已存在，则取消喜欢
     likedIds.splice(index, 1);
+    incrementAmount = -1;
   } else {
+    // 如果不存在，则添加喜欢
     likedIds.push(characterId);
+    incrementAmount = 1;
   }
   user.set('likedCharacterIds', likedIds);
-  await user.save(null, { useMasterKey: true });
+
+  // 3. 更新 Character 对象的 likeCount
+  character.increment('likeCount', incrementAmount);
+
+  // 4. 原子性地保存两个对象的更改
+  try {
+    await AV.Object.saveAll([user, character], { useMasterKey: true });
+  } catch (error) {
+    console.error(`原子性保存用户和角色失败:`, error);
+    throw new AV.Cloud.Error('更新点赞状态失败，请重试。', { code: 500 });
+  }
+  
+  // 5. 返回更新后的用户喜欢列表
   return likedIds;
 });
+// --- ^^^ 核心修改 ^^^ ---
+
+// --- vvv 核心新增：增加聊天计数的云函数 vvv ---
+AV.Cloud.define('incrementChatCount', async (request) => {
+  if (!request.currentUser) {
+    // 即使未登录也允许调用，但不做任何事，避免客户端报错
+    console.log("未登录用户尝试增加聊天计数，已忽略。");
+    return { success: true, message: "Ignored for anonymous user." };
+  }
+  const { characterId } = request.params;
+  if (typeof characterId !== 'number') {
+    throw new AV.Cloud.Error('参数 characterId 必须是一个数字。', { code: 400 });
+  }
+
+  const charQuery = new AV.Query('Character');
+  charQuery.equalTo('id', characterId);
+  const character = await charQuery.first({ useMasterKey: true });
+
+  if (character) {
+    character.increment('chatCount', 1);
+    await character.save(null, { useMasterKey: true });
+    return { success: true, message: `Character ${characterId} chat count incremented.` };
+  } else {
+    console.warn(`尝试为不存在的角色 (id: ${characterId}) 增加聊天计数。`);
+    return { success: false, message: `Character with id ${characterId} not found.` };
+  }
+});
+// --- ^^^ 核心新增 ^^^ ---
+
 
 AV.Cloud.define('getQiniuUploadToken', async (request) => {
   const accessKey = process.env.QINIU_AK;
@@ -355,9 +424,7 @@ AV.Cloud.define('publishApprovedCharacters', async (request) => {
       newChar.set('storyBackgroundPrompt', submissionData.storyBackgroundPrompt);
       newChar.set('storyStartPrompt', submissionData.storyStartPrompt);
       
-      // --- vvv 核心修改：确保 tags 被保存 vvv ---
-      newChar.set('tags', submissionData.tags || []); // 从提交数据中获取 tags
-      // --- ^^^ 核心修改 ^^^ ---
+      newChar.set('tags', submissionData.tags || []);
       
       if (submitter) {
         newChar.set('author', submitter);
