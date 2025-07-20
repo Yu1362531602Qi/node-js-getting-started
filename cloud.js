@@ -1,4 +1,4 @@
-// cloud.js (完整替换)
+// cloud.js (完整代码)
 
 'use strict';
 const AV = require('leanengine');
@@ -11,7 +11,6 @@ AV.Cloud.define('hello', function(request) {
 
 // --- 用户与个人资料 ---
 
-// --- vvv 核心修改 1：新增 updateUserProfile 云函数 vvv ---
 AV.Cloud.define('updateUserProfile', async (request) => {
   const user = request.currentUser;
   if (!user) {
@@ -20,25 +19,22 @@ AV.Cloud.define('updateUserProfile', async (request) => {
 
   const { username, bio } = request.params;
 
-  // 验证并设置昵称
   if (username !== undefined) {
     const trimmedUsername = username.trim();
     if (trimmedUsername.length < 2 || trimmedUsername.length > 15) {
       throw new AV.Cloud.Error('昵称长度必须在 2 到 15 个字符之间。', { code: 400 });
     }
-    // 检查昵称是否已被其他用户占用
     if (trimmedUsername !== user.get('username')) {
         const query = new AV.Query('_User');
         query.equalTo('username', trimmedUsername);
         const existingUser = await query.first();
         if (existingUser) {
-            throw new AV.Cloud.Error('该昵称已被使用。', { code: 409 }); // 409 Conflict
+            throw new AV.Cloud.Error('该昵称已被使用。', { code: 409 });
         }
     }
     user.set('username', trimmedUsername);
   }
 
-  // 验证并设置个性签名
   if (bio !== undefined) {
     if (typeof bio !== 'string' || bio.length > 100) {
       throw new AV.Cloud.Error('个性签名不能超过 100 个字符。', { code: 400 });
@@ -51,13 +47,12 @@ AV.Cloud.define('updateUserProfile', async (request) => {
     return { success: true, message: '个人资料更新成功' };
   } catch (error) {
     console.error(`更新用户 ${user.id} 资料失败:`, error);
-    if (error.code === 202) { // LeanCloud 内置的用户名/邮箱重复错误码
+    if (error.code === 202) {
          throw new AV.Cloud.Error('该昵称已被使用。', { code: 409 });
     }
     throw new AV.Cloud.Error('更新失败，请稍后再试。', { code: 500 });
   }
 });
-// --- ^^^ 核心修改 1 ^^^ ---
 
 AV.Cloud.define('getQiniuUserAvatarUploadToken', async (request) => {
   if (!request.currentUser) {
@@ -482,7 +477,6 @@ AV.Cloud.define('publishApprovedCharacters', async (request) => {
   return resultMessage;
 });
 
-// --- vvv 核心修改 2：让 getUserPublicProfile 返回 bio 字段 vvv ---
 AV.Cloud.define('getUserPublicProfile', async (request) => {
   const { userId } = request.params;
   const currentUser = request.currentUser;
@@ -490,7 +484,6 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
     throw new AV.Cloud.Error('必须提供 userId 参数。', { code: 400 });
   }
   const userQuery = new AV.Query('_User');
-  // 在这里添加 'bio'
   userQuery.select(['username', 'avatarUrl', 'objectId', 'followingCount', 'followersCount', 'bio']);
   const user = await userQuery.get(userId, { useMasterKey: true });
   if (!user) {
@@ -538,4 +531,198 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
     isFollowing: isFollowing,
   };
 });
-// --- ^^^ 核心修改 2 ^^^ ---
+
+// --- 新增的管理员批量操作函数 ---
+
+/**
+ * 预留一批连续的角色ID
+ * @param {number} count - 需要预留的ID数量
+ * @returns {object} - 包含起始ID和结束ID的对象, e.g., { startId: 50, endId: 69 }
+ */
+AV.Cloud.define('reserveCharacterIds', async (request) => {
+  if (!request.currentUser || !(await request.currentUser.isInRole('Admin'))) {
+    throw new AV.Cloud.Error('权限不足，仅限管理员操作。', { code: 403 });
+  }
+
+  const { count } = request.params;
+  if (typeof count !== 'number' || count <= 0 || count > 100) {
+    throw new AV.Cloud.Error('参数 count 必须是 1 到 100 之间的数字。', { code: 400 });
+  }
+
+  const counterQuery = new AV.Query('Counter');
+  counterQuery.equalTo('name', 'characterId');
+  let idCounter = await counterQuery.first({ useMasterKey: true });
+
+  if (!idCounter) {
+    console.log("未找到 characterId 计数器，正在初始化...");
+    const charQuery = new AV.Query('Character');
+    charQuery.descending('id');
+    charQuery.limit(1);
+    const maxIdChar = await charQuery.first({ useMasterKey: true });
+    const maxId = maxIdChar ? maxIdChar.get('id') : 0;
+    
+    const Counter = AV.Object.extend('Counter');
+    idCounter = new Counter();
+    idCounter.set('name', 'characterId');
+    idCounter.set('value', maxId);
+    await idCounter.save(null, { useMasterKey: true });
+    console.log(`计数器初始化完成，当前值为: ${maxId}`);
+  }
+
+  const updatedCounter = await idCounter.increment('value', count).save(null, {
+    fetchWhenSave: true,
+    useMasterKey: true
+  });
+
+  const endId = updatedCounter.get('value');
+  const startId = endId - count + 1;
+
+  console.log(`成功预留 ${count} 个ID。范围: ${startId} - ${endId}`);
+  return { startId, endId };
+});
+
+/**
+ * 批量添加官方角色卡 (使用预留好的ID)
+ * @param {Array<Object>} charactersData - 角色信息数组，每个对象必须包含 id 字段
+ */
+AV.Cloud.define('batchAddOfficialCharacters', async (request) => {
+  if (!request.currentUser || !(await request.currentUser.isInRole('Admin'))) {
+    throw new AV.Cloud.Error('权限不足，仅限管理员操作。', { code: 403 });
+  }
+
+  const { charactersData } = request.params;
+  if (!Array.isArray(charactersData) || charactersData.length === 0) {
+    throw new AV.Cloud.Error('参数 charactersData 必须是一个包含角色对象的数组。', { code: 400 });
+  }
+
+  const charactersToSave = [];
+  const Character = AV.Object.extend('Character');
+  const existingIds = new Set();
+
+  for (const charData of charactersData) {
+    if (typeof charData.id !== 'number') {
+      throw new AV.Cloud.Error(`发现一个角色数据缺少有效的数字 "id" 字段: ${JSON.stringify(charData)}`, { code: 400 });
+    }
+    if (existingIds.has(charData.id)) {
+       throw new AV.Cloud.Error(`数据中存在重复的ID: ${charData.id}`, { code: 400 });
+    }
+    existingIds.add(charData.id);
+
+    const newChar = new Character();
+    
+    newChar.set('id', charData.id);
+    newChar.set('name', charData.name || '未命名');
+    newChar.set('description', charData.description || '');
+    newChar.set('imageUrl', charData.imageUrl || '');
+    newChar.set('characterPrompt', charData.characterPrompt || '');
+    newChar.set('userProfilePrompt', charData.userProfilePrompt || '');
+    newChar.set('storyBackgroundPrompt', charData.storyBackgroundPrompt || '');
+    newChar.set('storyStartPrompt', charData.storyStartPrompt || '');
+    newChar.set('tags', charData.tags || []);
+    
+    charactersToSave.push(newChar);
+  }
+
+  const idQuery = new AV.Query('Character');
+  idQuery.containedIn('id', Array.from(existingIds));
+  const conflictedChars = await idQuery.find({ useMasterKey: true });
+  if (conflictedChars.length > 0) {
+      const conflictedIds = conflictedChars.map(c => c.get('id'));
+      throw new AV.Cloud.Error(`操作被中断！以下ID已存在于数据库中: ${conflictedIds.join(', ')}`, { code: 409 });
+  }
+
+  if (charactersToSave.length > 0) {
+    try {
+      await AV.Object.saveAll(charactersToSave, { useMasterKey: true });
+    } catch (error) {
+      console.error('批量保存角色时发生错误:', error);
+      throw new AV.Cloud.Error('批量保存失败，请检查日志。', { code: 500 });
+    }
+  }
+
+  return `操作成功！成功添加了 ${charactersToSave.length} 个官方角色。`;
+});
+
+/**
+ * 批量删除角色及其在七牛云上的图片文件
+ * @param {Array<number>} characterIds - 需要删除的 Character 表中的 id 数组
+ */
+AV.Cloud.define('batchDeleteCharacters', async (request) => {
+  if (!request.currentUser || !(await request.currentUser.isInRole('Admin'))) {
+    throw new AV.Cloud.Error('权限不足，仅限管理员操作。', { code: 403 });
+  }
+
+  const { characterIds } = request.params;
+  if (!Array.isArray(characterIds) || characterIds.length === 0) {
+    throw new AV.Cloud.Error('参数 characterIds 必须是一个包含数字ID的数组。', { code: 400 });
+  }
+
+  console.log(`准备删除角色，ID列表: ${characterIds.join(', ')}`);
+
+  const query = new AV.Query('Character');
+  query.containedIn('id', characterIds);
+  query.limit(1000);
+  const charactersToDelete = await query.find({ useMasterKey: true });
+
+  if (charactersToDelete.length === 0) {
+    return '没有找到与提供的ID匹配的角色，无需删除。';
+  }
+
+  const qiniuKeysToDelete = [];
+  const bucketUrl = process.env.QINIU_BUCKET_URL;
+  if (!bucketUrl) {
+    throw new AV.Cloud.Error('环境变量 QINIU_BUCKET_URL 未设置，无法删除图片。', { code: 500 });
+  }
+
+  for (const char of charactersToDelete) {
+    const imageUrl = char.get('imageUrl');
+    if (imageUrl && imageUrl.startsWith(bucketUrl)) {
+      const key = imageUrl.replace(bucketUrl + '/', '');
+      qiniuKeysToDelete.push(key);
+    }
+  }
+
+  if (qiniuKeysToDelete.length > 0) {
+    try {
+      const accessKey = process.env.QINIU_AK;
+      const secretKey = process.env.QINIU_SK;
+      const bucket = process.env.QINIU_BUCKET_NAME;
+      const mac = new qiniu.auth.digest.Mac(accessKey, secretKey);
+      const config = new qiniu.conf.Config();
+      const bucketManager = new qiniu.rs.BucketManager(mac, config);
+      
+      const deleteOperations = qiniuKeysToDelete.map(key => qiniu.rs.deleteOp(bucket, key));
+
+      await new Promise((resolve, reject) => {
+        bucketManager.batch(deleteOperations, (err, respBody, respInfo) => {
+          if (err) {
+            return reject(err);
+          }
+          if (respInfo.statusCode === 200) {
+            const hasError = respBody.some(item => item.code !== 200 && item.code !== 612);
+            if (hasError) {
+              console.error('七牛云部分文件删除失败:', respBody);
+            }
+            resolve(respBody);
+          } else {
+            reject(new Error(`七牛云批量删除请求失败，状态码: ${respInfo.statusCode}, 信息: ${JSON.stringify(respBody)}`));
+          }
+        });
+      });
+      console.log(`成功从七牛云删除 ${qiniuKeysToDelete.length} 个图片文件。`);
+    } catch (e) {
+      console.error('删除七牛云文件时发生严重错误:', e);
+      throw new AV.Cloud.Error('删除七牛云图片失败，操作已中断。', { code: 500 });
+    }
+  }
+
+  try {
+    await AV.Object.destroyAll(charactersToDelete, { useMasterKey: true });
+    console.log(`成功从 LeanCloud 删除了 ${charactersToDelete.length} 个角色对象。`);
+  } catch (error) {
+    console.error('删除 LeanCloud 角色数据时发生错误:', error);
+    throw new AV.Cloud.Error('删除数据库记录失败。', { code: 500 });
+  }
+
+  return `操作成功！删除了 ${charactersToDelete.length} 个角色记录和 ${qiniuKeysToDelete.length} 个关联图片。`;
+});
