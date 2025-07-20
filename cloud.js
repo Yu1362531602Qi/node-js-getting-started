@@ -1,4 +1,4 @@
-// cloud.js
+// cloud.js (完整替换)
 
 'use strict';
 const AV = require('leanengine');
@@ -10,6 +10,54 @@ AV.Cloud.define('hello', function(request) {
 
 
 // --- 用户与个人资料 ---
+
+// --- vvv 核心修改 1：新增 updateUserProfile 云函数 vvv ---
+AV.Cloud.define('updateUserProfile', async (request) => {
+  const user = request.currentUser;
+  if (!user) {
+    throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
+  }
+
+  const { username, bio } = request.params;
+
+  // 验证并设置昵称
+  if (username !== undefined) {
+    const trimmedUsername = username.trim();
+    if (trimmedUsername.length < 2 || trimmedUsername.length > 15) {
+      throw new AV.Cloud.Error('昵称长度必须在 2 到 15 个字符之间。', { code: 400 });
+    }
+    // 检查昵称是否已被其他用户占用
+    if (trimmedUsername !== user.get('username')) {
+        const query = new AV.Query('_User');
+        query.equalTo('username', trimmedUsername);
+        const existingUser = await query.first();
+        if (existingUser) {
+            throw new AV.Cloud.Error('该昵称已被使用。', { code: 409 }); // 409 Conflict
+        }
+    }
+    user.set('username', trimmedUsername);
+  }
+
+  // 验证并设置个性签名
+  if (bio !== undefined) {
+    if (typeof bio !== 'string' || bio.length > 100) {
+      throw new AV.Cloud.Error('个性签名不能超过 100 个字符。', { code: 400 });
+    }
+    user.set('bio', bio);
+  }
+
+  try {
+    await user.save(null, { useMasterKey: true });
+    return { success: true, message: '个人资料更新成功' };
+  } catch (error) {
+    console.error(`更新用户 ${user.id} 资料失败:`, error);
+    if (error.code === 202) { // LeanCloud 内置的用户名/邮箱重复错误码
+         throw new AV.Cloud.Error('该昵称已被使用。', { code: 409 });
+    }
+    throw new AV.Cloud.Error('更新失败，请稍后再试。', { code: 500 });
+  }
+});
+// --- ^^^ 核心修改 1 ^^^ ---
 
 AV.Cloud.define('getQiniuUserAvatarUploadToken', async (request) => {
   if (!request.currentUser) {
@@ -208,7 +256,6 @@ AV.Cloud.define('generateNewLocalCharacterId', async (request) => {
   return newId;
 });
 
-// --- vvv 核心修改：增强 toggleLikeCharacter 函数 vvv ---
 AV.Cloud.define('toggleLikeCharacter', async (request) => {
   const user = request.currentUser;
   if (!user) {
@@ -219,12 +266,10 @@ AV.Cloud.define('toggleLikeCharacter', async (request) => {
     throw new AV.Cloud.Error('参数 characterId 必须是一个数字。', { code: 400 });
   }
 
-  // 1. 查找对应的 Character 对象
   const charQuery = new AV.Query('Character');
   charQuery.equalTo('id', characterId);
   const character = await charQuery.first({ useMasterKey: true });
   if (!character) {
-    // 如果角色不存在，则只更新用户自己的列表，以处理本地角色或已删除角色的情况
     console.warn(`未在 Character 表中找到 id 为 ${characterId} 的角色，将只更新用户喜欢列表。`);
     const likedIds = user.get('likedCharacterIds') || [];
     const index = likedIds.indexOf(characterId);
@@ -238,26 +283,21 @@ AV.Cloud.define('toggleLikeCharacter', async (request) => {
     return likedIds;
   }
 
-  // 2. 更新用户的 likedCharacterIds 数组
   const likedIds = user.get('likedCharacterIds') || [];
   const index = likedIds.indexOf(characterId);
   let incrementAmount = 0;
 
   if (index > -1) {
-    // 如果已存在，则取消喜欢
     likedIds.splice(index, 1);
     incrementAmount = -1;
   } else {
-    // 如果不存在，则添加喜欢
     likedIds.push(characterId);
     incrementAmount = 1;
   }
   user.set('likedCharacterIds', likedIds);
 
-  // 3. 更新 Character 对象的 likeCount
   character.increment('likeCount', incrementAmount);
 
-  // 4. 原子性地保存两个对象的更改
   try {
     await AV.Object.saveAll([user, character], { useMasterKey: true });
   } catch (error) {
@@ -265,15 +305,11 @@ AV.Cloud.define('toggleLikeCharacter', async (request) => {
     throw new AV.Cloud.Error('更新点赞状态失败，请重试。', { code: 500 });
   }
   
-  // 5. 返回更新后的用户喜欢列表
   return likedIds;
 });
-// --- ^^^ 核心修改 ^^^ ---
 
-// --- vvv 核心新增：增加聊天计数的云函数 vvv ---
 AV.Cloud.define('incrementChatCount', async (request) => {
   if (!request.currentUser) {
-    // 即使未登录也允许调用，但不做任何事，避免客户端报错
     console.log("未登录用户尝试增加聊天计数，已忽略。");
     return { success: true, message: "Ignored for anonymous user." };
   }
@@ -295,7 +331,6 @@ AV.Cloud.define('incrementChatCount', async (request) => {
     return { success: false, message: `Character with id ${characterId} not found.` };
   }
 });
-// --- ^^^ 核心新增 ^^^ ---
 
 
 AV.Cloud.define('getQiniuUploadToken', async (request) => {
@@ -447,6 +482,7 @@ AV.Cloud.define('publishApprovedCharacters', async (request) => {
   return resultMessage;
 });
 
+// --- vvv 核心修改 2：让 getUserPublicProfile 返回 bio 字段 vvv ---
 AV.Cloud.define('getUserPublicProfile', async (request) => {
   const { userId } = request.params;
   const currentUser = request.currentUser;
@@ -454,7 +490,8 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
     throw new AV.Cloud.Error('必须提供 userId 参数。', { code: 400 });
   }
   const userQuery = new AV.Query('_User');
-  userQuery.select(['username', 'avatarUrl', 'objectId', 'followingCount', 'followersCount']);
+  // 在这里添加 'bio'
+  userQuery.select(['username', 'avatarUrl', 'objectId', 'followingCount', 'followersCount', 'bio']);
   const user = await userQuery.get(userId, { useMasterKey: true });
   if (!user) {
     throw new AV.Cloud.Error('用户不存在。', { code: 404 });
@@ -501,3 +538,4 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
     isFollowing: isFollowing,
   };
 });
+// --- ^^^ 核心修改 2 ^^^ ---
