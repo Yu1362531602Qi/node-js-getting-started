@@ -609,9 +609,17 @@ AV.Cloud.define('batchAddOfficialCharacters', async (request) => {
     throw new AV.Cloud.Error('权限不足，仅限管理员操作。', { code: 403 });
   }
 
-  const { charactersData } = request.params;
-  if (!Array.isArray(charactersData) || charactersData.length === 0) {
-    throw new AV.Cloud.Error('参数 charactersData 必须是一个包含角色对象的数组。', { code: 400 });
+  let charactersData;
+  if (Array.isArray(request.params)) {
+    charactersData = request.params;
+  } else if (request.params && Array.isArray(request.params.charactersData)) {
+    charactersData = request.params.charactersData;
+  } else {
+    throw new AV.Cloud.Error('参数格式无效。请直接粘贴角色数组，或使用 {"charactersData": [...]} 的格式。', { code: 400 });
+  }
+
+  if (charactersData.length === 0) {
+    return "传入的角色数组为空，未执行任何操作。";
   }
 
   const charactersToSave = [];
