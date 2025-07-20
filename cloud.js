@@ -1,18 +1,43 @@
-// cloud.js (完整修正版)
+// cloud.js (最终修正版)
 
 'use strict';
 const AV = require('leanengine');
 const qiniu = require('qiniu');
 
-// --- 辅助函数：检查用户是否为管理员 ---
+// --- vvv 核心修正：重写 isAdmin 辅助函数，使用更可靠的 Relation 查询方式 vvv ---
+/**
+ * 检查一个用户是否属于 'Admin' 角色
+ * @param {AV.User} user - 需要检查的用户对象
+ * @returns {Promise<boolean>} - 如果是管理员则返回 true，否则返回 false
+ */
 const isAdmin = async (user) => {
-  if (!user) return false;
-  const query = new AV.Query(AV.Role);
-  query.equalTo('name', 'Admin');
-  query.equalTo('users', user);
-  const count = await query.count({ useMasterKey: true });
+  if (!user) {
+    return false;
+  }
+  
+  // 1. 先找到名为 'Admin' 的角色对象
+  const roleQuery = new AV.Query(AV.Role);
+  roleQuery.equalTo('name', 'Admin');
+  const adminRole = await roleQuery.first({ useMasterKey: true });
+
+  // 如果 'Admin' 角色本身就不存在，直接返回 false
+  if (!adminRole) {
+    console.error("错误：数据库中不存在名为 'Admin' 的角色。请先创建。");
+    return false;
+  }
+
+  // 2. 获取该角色的 'users' 关系
+  const userRelation = adminRole.relation('users');
+
+  // 3. 在这个关系中查询是否存在当前用户
+  const relationQuery = userRelation.query();
+  relationQuery.equalTo('objectId', user.id);
+  const count = await relationQuery.count({ useMasterKey: true });
+
+  // 如果能找到（count > 0），则说明是管理员
   return count > 0;
 };
+// --- ^^^ 核心修正 ^^^ ---
 
 
 AV.Cloud.define('hello', function(request) {
@@ -546,11 +571,9 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
 // --- 管理员批量操作函数 ---
 
 AV.Cloud.define('reserveCharacterIds', async (request) => {
-  // --- vvv 核心修正：使用新的 isAdmin 辅助函数 ---
   if (!(await isAdmin(request.currentUser))) {
     throw new AV.Cloud.Error('权限不足，仅限管理员操作。', { code: 403 });
   }
-  // --- ^^^ 核心修正 ^^^ ---
 
   const { count } = request.params;
   if (typeof count !== 'number' || count <= 0 || count > 100) {
@@ -590,11 +613,9 @@ AV.Cloud.define('reserveCharacterIds', async (request) => {
 });
 
 AV.Cloud.define('batchAddOfficialCharacters', async (request) => {
-  // --- vvv 核心修正：使用新的 isAdmin 辅助函数 ---
   if (!(await isAdmin(request.currentUser))) {
     throw new AV.Cloud.Error('权限不足，仅限管理员操作。', { code: 403 });
   }
-  // --- ^^^ 核心修正 ^^^ ---
 
   const { charactersData } = request.params;
   if (!Array.isArray(charactersData) || charactersData.length === 0) {
@@ -650,11 +671,9 @@ AV.Cloud.define('batchAddOfficialCharacters', async (request) => {
 });
 
 AV.Cloud.define('batchDeleteCharacters', async (request) => {
-  // --- vvv 核心修正：使用新的 isAdmin 辅助函数 ---
   if (!(await isAdmin(request.currentUser))) {
     throw new AV.Cloud.Error('权限不足，仅限管理员操作。', { code: 403 });
   }
-  // --- ^^^ 核心修正 ^^^ ---
 
   const { characterIds } = request.params;
   if (!Array.isArray(characterIds) || characterIds.length === 0) {
