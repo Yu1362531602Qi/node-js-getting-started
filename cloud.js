@@ -1,4 +1,4 @@
-// cloud.js (完整修正版)
+// cloud.js (完整最终修正版)
 
 'use strict';
 const AV = require('leanengine');
@@ -7,6 +7,7 @@ const qiniu = require('qiniu');
 // --- 辅助函数：检查用户是否为管理员 ---
 const isAdmin = async (user) => {
   if (!user) return false;
+  // LeanCloud SDK 中检查用户角色的正确方式是通过查询 _Role 表
   const query = new AV.Query(AV.Role);
   query.equalTo('name', 'Admin');
   query.equalTo('users', user);
@@ -546,35 +547,49 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
 // --- 管理员批量操作函数 ---
 
 AV.Cloud.define('reserveCharacterIds', async (request) => {
-  // --- vvv 核心修正：使用新的 isAdmin 辅助函数 ---
   if (!(await isAdmin(request.currentUser))) {
     throw new AV.Cloud.Error('权限不足，仅限管理员操作。', { code: 403 });
   }
-  // --- ^^^ 核心修正 ^^^ ---
 
   const { count } = request.params;
   if (typeof count !== 'number' || count <= 0 || count > 100) {
     throw new AV.Cloud.Error('参数 count 必须是 1 到 100 之间的数字。', { code: 400 });
   }
 
+  const Counter = AV.Object.extend('Counter');
+  let idCounter;
+
   const counterQuery = new AV.Query('Counter');
   counterQuery.equalTo('name', 'characterId');
-  let idCounter = await counterQuery.first({ useMasterKey: true });
+  idCounter = await counterQuery.first({ useMasterKey: true });
 
   if (!idCounter) {
     console.log("未找到 characterId 计数器，正在初始化...");
+    
     const charQuery = new AV.Query('Character');
     charQuery.descending('id');
     charQuery.limit(1);
     const maxIdChar = await charQuery.first({ useMasterKey: true });
     const maxId = maxIdChar ? maxIdChar.get('id') : 0;
     
-    const Counter = AV.Object.extend('Counter');
     idCounter = new Counter();
     idCounter.set('name', 'characterId');
     idCounter.set('value', maxId);
-    await idCounter.save(null, { useMasterKey: true });
-    console.log(`计数器初始化完成，当前值为: ${maxId}`);
+    
+    try {
+      await idCounter.save(null, { useMasterKey: true });
+      console.log(`计数器初始化完成，当前值为: ${maxId}`);
+    } catch (error) {
+      if (error.code === 137) {
+        console.log("创建计数器时发生唯一索引冲突，重新查询...");
+        idCounter = await counterQuery.first({ useMasterKey: true });
+        if (!idCounter) {
+            throw new AV.Cloud.Error('初始化计数器失败，请重试。', { code: 500 });
+        }
+      } else {
+        throw error;
+      }
+    }
   }
 
   const updatedCounter = await idCounter.increment('value', count).save(null, {
@@ -590,11 +605,9 @@ AV.Cloud.define('reserveCharacterIds', async (request) => {
 });
 
 AV.Cloud.define('batchAddOfficialCharacters', async (request) => {
-  // --- vvv 核心修正：使用新的 isAdmin 辅助函数 ---
   if (!(await isAdmin(request.currentUser))) {
     throw new AV.Cloud.Error('权限不足，仅限管理员操作。', { code: 403 });
   }
-  // --- ^^^ 核心修正 ^^^ ---
 
   const { charactersData } = request.params;
   if (!Array.isArray(charactersData) || charactersData.length === 0) {
@@ -650,11 +663,9 @@ AV.Cloud.define('batchAddOfficialCharacters', async (request) => {
 });
 
 AV.Cloud.define('batchDeleteCharacters', async (request) => {
-  // --- vvv 核心修正：使用新的 isAdmin 辅助函数 ---
   if (!(await isAdmin(request.currentUser))) {
     throw new AV.Cloud.Error('权限不足，仅限管理员操作。', { code: 403 });
   }
-  // --- ^^^ 核心修正 ^^^ ---
 
   const { characterIds } = request.params;
   if (!Array.isArray(characterIds) || characterIds.length === 0) {
