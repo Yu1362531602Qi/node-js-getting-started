@@ -1,4 +1,4 @@
-// cloud.js (完整版)
+// cloud.js (修复语法错误后的完整版)
 
 'use strict';
 const AV = require('leanengine');
@@ -763,4 +763,4 @@ AV.Cloud.define('migrateAllCharactersToOwner', async (request) => {
 });
 
 
-module.exports = AV.Cloud;```
+module.exports = AV.Cloud;
