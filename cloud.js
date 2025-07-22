@@ -1,4 +1,4 @@
-// cloud.js (最终精简版)
+// cloud.js (完整版)
 
 'use strict';
 const AV = require('leanengine');
@@ -698,3 +698,69 @@ AV.Cloud.define('batchDeleteCharacters', async (request) => {
 
   return `操作成功！删除了 ${charactersToDelete.length} 个角色记录和 ${qiniuKeysToDelete.length} 个关联图片。`;
 });
+
+
+// --- 数据迁移函数 ---
+
+/**
+ * @description 这是一个一次性的数据迁移函数，用于将所有 Character 的作者指向一个特定用户。
+ * @danger 这是一个高危操作，执行前请务必备份数据！
+ */
+AV.Cloud.define('migrateAllCharactersToOwner', async (request) => {
+  // 1. 身份验证：确保只有管理员能执行此操作
+  if (!(await isAdmin(request.currentUser))) {
+    throw new AV.Cloud.Error('权限不足，仅限管理员操作。', { code: 403 });
+  }
+
+  // 2. 目标账户信息：根据您提供的截图，硬编码您的账户信息
+  const ownerId = '68651ac4ce7fc86faf9b4eb5';
+  const ownerName = '雨息';
+
+  // 创建一个指向您用户账户的指针对象
+  const ownerPointer = AV.Object.createWithoutData('_User', ownerId);
+
+  // 3. 分批处理逻辑
+  let totalUpdatedCount = 0;
+  let skip = 0;
+  const limit = 200; // 每次处理200条，这是一个比较安全的大小
+  let hasMore = true;
+
+  console.log(`开始迁移任务：将所有角色作者更改为 ${ownerName} (ID: ${ownerId})`);
+
+  while (hasMore) {
+    const query = new AV.Query('Character');
+    query.limit(limit);
+    query.skip(skip);
+    // 我们不需要获取所有字段，但为了安全起见，这里获取全部
+    const charactersToUpdate = await query.find({ useMasterKey: true });
+
+    if (charactersToUpdate.length > 0) {
+      // 4. 更新当前批次的角色数据
+      for (const char of charactersToUpdate) {
+        char.set('author', ownerPointer);
+        char.set('authorName', ownerName);
+      }
+
+      // 5. 批量保存更新
+      try {
+        await AV.Object.saveAll(charactersToUpdate, { useMasterKey: true });
+        totalUpdatedCount += charactersToUpdate.length;
+        skip += charactersToUpdate.length;
+        console.log(`成功处理 ${charactersToUpdate.length} 个角色，当前总计: ${totalUpdatedCount}`);
+      } catch (error) {
+        console.error(`在处理批次时发生错误 (skip=${skip}):`, error);
+        throw new AV.Cloud.Error(`批量保存失败，请检查日志。已处理 ${totalUpdatedCount} 个。`, { code: 500 });
+      }
+    } else {
+      // 如果查询结果为空，说明所有角色都已处理完毕
+      hasMore = false;
+    }
+  }
+
+  const resultMessage = `迁移任务完成！总共更新了 ${totalUpdatedCount} 个角色的作者信息为 "${ownerName}"。`;
+  console.log(resultMessage);
+  return resultMessage;
+});
+
+
+module.exports = AV.Cloud;```
