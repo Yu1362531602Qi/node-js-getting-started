@@ -1,4 +1,4 @@
-// cloud.js (已为您添加分页加载逻辑)
+// cloud.js (已为您添加“喜爱”总数统计)
 
 'use strict';
 const AV = require('leanengine');
@@ -488,7 +488,6 @@ AV.Cloud.define('publishApprovedCharacters', async (request) => {
   return resultMessage;
 });
 
-// --- vvv 核心修改 1：修改 getUserPublicProfile，使其不再返回作品列表 vvv ---
 AV.Cloud.define('getUserPublicProfile', async (request) => {
   const { userId } = request.params;
   const currentUser = request.currentUser;
@@ -502,16 +501,41 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
     throw new AV.Cloud.Error('用户不存在。', { code: 404 });
   }
 
-  // 获取作品总数
   const creationsCountQuery = new AV.Query('Character');
   creationsCountQuery.equalTo('author', AV.Object.createWithoutData('_User', userId));
   const creationsCount = await creationsCountQuery.count({ useMasterKey: true });
 
+  // --- vvv 核心修改：计算喜爱总数 vvv ---
+  let totalLikes = 0;
+  // 为了处理可能超过1000个作品的用户，我们使用分页循环来累加
+  let hasMore = true;
+  let skip = 0;
+  const limit = 1000; // LeanCloud find 方法单次查询上限
+
+  while (hasMore) {
+    const likesQuery = new AV.Query('Character');
+    likesQuery.equalTo('author', AV.Object.createWithoutData('_User', userId));
+    likesQuery.select(['likeCount']); // 仅查询 likeCount 字段以提高效率
+    likesQuery.limit(limit);
+    likesQuery.skip(skip);
+    const characters = await likesQuery.find({ useMasterKey: true });
+
+    if (characters.length > 0) {
+      for (const char of characters) {
+        totalLikes += char.get('likeCount') || 0; // 累加，如果 likeCount 不存在则按0计算
+      }
+      skip += characters.length;
+    } else {
+      hasMore = false;
+    }
+  }
+  // --- ^^^ 核心修改 ^^^ ---
+
   const stats = {
     following: user.get('followingCount') || 0,
     followers: user.get('followersCount') || 0,
-    likesReceived: 0, // 这个字段的计算比较复杂，暂时保持为0
-    creations: creationsCount, // 新增作品总数统计
+    likesReceived: totalLikes, // 使用计算出的总数
+    creations: creationsCount,
   };
   
   let isFollowing = false;
@@ -525,17 +549,13 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
     }
   }
   
-  // 返回的数据不再包含 creations 列表
   return {
     user: user.toJSON(),
     stats: stats,
     isFollowing: isFollowing,
   };
 });
-// --- ^^^ 核心修改 1 ^^^ ---
 
-
-// --- vvv 核心新增 2：添加 getUserCreations 函数，用于分页加载作品 vvv ---
 AV.Cloud.define('getUserCreations', async (request) => {
   const { targetUserId, page = 1, limit = 20 } = request.params;
   if (!targetUserId) {
@@ -552,7 +572,6 @@ AV.Cloud.define('getUserCreations', async (request) => {
   
   return characters.map(char => char.toJSON());
 });
-// --- ^^^ 核心新增 2 ^^^ ---
 
 
 // --- 管理员批量操作函数 ---
