@@ -1,4 +1,4 @@
-// cloud.js (修复语法错误后的完整版)
+// cloud.js (已为您优化 getUserPublicProfile 函数)
 
 'use strict';
 const AV = require('leanengine');
@@ -500,31 +500,28 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
   if (!user) {
     throw new AV.Cloud.Error('用户不存在。', { code: 404 });
   }
-  const creationsQuery = new AV.Query('CharacterSubmissions');
-  creationsQuery.equalTo('submitter', AV.Object.createWithoutData('_User', userId));
-  creationsQuery.equalTo('status', 'published');
-  creationsQuery.descending('createdAt');
-  creationsQuery.limit(50);
-  const submissions = await creationsQuery.find();
-  const creations = submissions.map(sub => {
-    const charData = sub.get('characterData');
-    return {
-      id: sub.get('localId'), 
-      name: charData.name,
-      description: charData.description,
-      imageUrl: sub.get('imageUrl'),
-      characterPrompt: charData.characterPrompt,
-      userProfilePrompt: charData.userProfilePrompt,
-      storyBackgroundPrompt: charData.storyBackgroundPrompt,
-      storyStartPrompt: charData.storyStartPrompt,
-      tags: charData.tags || [],
-    };
-  });
+
+  // --- vvv 核心修改：作品查询逻辑 vvv ---
+  // 直接从 Character 表查询，而不是从 CharacterSubmissions 表
+  const creationsQuery = new AV.Query('Character');
+  // 使用 'author' 字段（Pointer类型）进行匹配
+  creationsQuery.equalTo('author', AV.Object.createWithoutData('_User', userId));
+  creationsQuery.descending('createdAt'); // 按创建时间降序排列
+  creationsQuery.limit(100); // 设置一个合理的上限，防止数据过多
+  
+  // 使用 masterKey 查询以忽略 ACL 限制，确保能查到所有公开作品
+  const characters = await creationsQuery.find({ useMasterKey: true });
+  
+  // 直接将查询到的 Character 对象转换为 JSON，前端可以直接使用
+  const creations = characters.map(char => char.toJSON());
+  // --- ^^^ 核心修改 ^^^ ---
+
   const stats = {
     following: user.get('followingCount') || 0,
     followers: user.get('followersCount') || 0,
-    likesReceived: 0,
+    likesReceived: 0, // 这个字段的计算比较复杂，暂时保持为0
   };
+  
   let isFollowing = false;
   if (currentUser && currentUser.id !== userId) {
     const followQuery = new AV.Query('Follow');
@@ -535,6 +532,7 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
       isFollowing = true;
     }
   }
+  
   return {
     user: user.toJSON(),
     creations: creations,
