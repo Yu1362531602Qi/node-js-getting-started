@@ -1,4 +1,4 @@
-// cloud.js (已为您优化 getUserPublicProfile 函数)
+// cloud.js (已为您添加分页加载逻辑)
 
 'use strict';
 const AV = require('leanengine');
@@ -488,6 +488,7 @@ AV.Cloud.define('publishApprovedCharacters', async (request) => {
   return resultMessage;
 });
 
+// --- vvv 核心修改 1：修改 getUserPublicProfile，使其不再返回作品列表 vvv ---
 AV.Cloud.define('getUserPublicProfile', async (request) => {
   const { userId } = request.params;
   const currentUser = request.currentUser;
@@ -501,25 +502,16 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
     throw new AV.Cloud.Error('用户不存在。', { code: 404 });
   }
 
-  // --- vvv 核心修改：作品查询逻辑 vvv ---
-  // 直接从 Character 表查询，而不是从 CharacterSubmissions 表
-  const creationsQuery = new AV.Query('Character');
-  // 使用 'author' 字段（Pointer类型）进行匹配
-  creationsQuery.equalTo('author', AV.Object.createWithoutData('_User', userId));
-  creationsQuery.descending('createdAt'); // 按创建时间降序排列
-  creationsQuery.limit(100); // 设置一个合理的上限，防止数据过多
-  
-  // 使用 masterKey 查询以忽略 ACL 限制，确保能查到所有公开作品
-  const characters = await creationsQuery.find({ useMasterKey: true });
-  
-  // 直接将查询到的 Character 对象转换为 JSON，前端可以直接使用
-  const creations = characters.map(char => char.toJSON());
-  // --- ^^^ 核心修改 ^^^ ---
+  // 获取作品总数
+  const creationsCountQuery = new AV.Query('Character');
+  creationsCountQuery.equalTo('author', AV.Object.createWithoutData('_User', userId));
+  const creationsCount = await creationsCountQuery.count({ useMasterKey: true });
 
   const stats = {
     following: user.get('followingCount') || 0,
     followers: user.get('followersCount') || 0,
     likesReceived: 0, // 这个字段的计算比较复杂，暂时保持为0
+    creations: creationsCount, // 新增作品总数统计
   };
   
   let isFollowing = false;
@@ -533,13 +525,35 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
     }
   }
   
+  // 返回的数据不再包含 creations 列表
   return {
     user: user.toJSON(),
-    creations: creations,
     stats: stats,
     isFollowing: isFollowing,
   };
 });
+// --- ^^^ 核心修改 1 ^^^ ---
+
+
+// --- vvv 核心新增 2：添加 getUserCreations 函数，用于分页加载作品 vvv ---
+AV.Cloud.define('getUserCreations', async (request) => {
+  const { targetUserId, page = 1, limit = 20 } = request.params;
+  if (!targetUserId) {
+    throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
+  }
+
+  const creationsQuery = new AV.Query('Character');
+  creationsQuery.equalTo('author', AV.Object.createWithoutData('_User', targetUserId));
+  creationsQuery.descending('createdAt');
+  creationsQuery.skip((page - 1) * limit);
+  creationsQuery.limit(limit);
+  
+  const characters = await creationsQuery.find({ useMasterKey: true });
+  
+  return characters.map(char => char.toJSON());
+});
+// --- ^^^ 核心新增 2 ^^^ ---
+
 
 // --- 管理员批量操作函数 ---
 
