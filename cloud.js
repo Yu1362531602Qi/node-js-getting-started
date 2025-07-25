@@ -1,75 +1,51 @@
-// cloud.js (完整版，已集成握手和会话令牌安全机制)
+// cloud.js (完整版，已修复 beforeLogin 错误并替换为 proxyLogin)
 
 'use strict';
 const AV = require('leanengine');
 const qiniu = require('qiniu');
-const crypto = require('crypto'); // 引入 Node.js 的加密模块
+const crypto = require('crypto');
 
 // =================================================================
 // == 安全校验核心模块
 // =================================================================
 
-/**
- * @description 安全校验辅助函数，用于验证请求是否来自已通过握手的合法 App 实例。
- * @param {object} request - LeanCloud 云函数的请求对象。
- */
 const validateSessionAuth = (request) => {
-  // 从请求头中获取客户端在握手成功后获得的会话令牌
   const sessionAuthToken = request.expressReq.get('X-Session-Auth-Token');
-  
-  // 在生产环境中，如果缺少此令牌，应直接拒绝请求。
   if (!sessionAuthToken) {
     throw new AV.Cloud.Error('无效的客户端，禁止操作。', { code: 403 });
   }
-  
-  // 在真实的生产环境中，未来可以在这里增加对令牌有效性的进一步校验（例如查询Redis缓存）。
-  // 但在初期，仅检查其是否存在，就已经能阻止绕过握手的直接调用。
   const functionName = request.functionName || (request.object ? 'login' : 'unknown');
   console.log(`Session Auth Token 校验通过，函数: ${functionName}`);
 };
 
-/**
- * @description 客户端启动时的安全握手函数。
- * @param {object} params - 包含 version, timestamp, signature。
- * @returns {object} - 包含版本状态和会话令牌的配置对象。
- */
 AV.Cloud.define('handshake', async (request) => {
   const { version, timestamp, signature } = request.params;
-
   if (!version || !timestamp || !signature) {
     throw new AV.Cloud.Error('无效的握手请求，缺少参数。', { code: 400 });
   }
-
   const clientTimestamp = parseInt(timestamp, 10);
   const serverTimestamp = Math.floor(Date.now() / 1000);
-  
-  if (Math.abs(serverTimestamp - clientTimestamp) > 300) { // 5分钟有效期
+  if (Math.abs(serverTimestamp - clientTimestamp) > 300) {
     console.warn(`拒绝过期的握手请求。服务器时间: ${serverTimestamp}, 客户端时间: ${clientTimestamp}`);
     throw new AV.Cloud.Error('请求已过期或设备时间不正确。', { code: 408 });
   }
-
   const rootKey = process.env.CLIENT_ROOT_KEY;
   if (!rootKey) {
       console.error('FATAL: 环境变量 CLIENT_ROOT_KEY 未设置！');
       throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
   }
-  
   const challengeData = `${version}|${timestamp}`;
   const hmac = crypto.createHmac('sha256', rootKey);
   hmac.update(challengeData);
   const serverSignature = hmac.digest('hex');
-
   if (serverSignature !== signature) {
     console.error(`签名验证失败！客户端签名: ${signature}, 服务器计算签名: ${serverSignature}`);
     throw new AV.Cloud.Error('签名验证失败。', { code: 403 });
   }
-
   console.log(`版本 ${version} 的客户端握手成功。`);
-
   const versionQuery = new AV.Query('VersionConfig');
   versionQuery.equalTo('versionName', version);
   const versionConfig = await versionQuery.first({ useMasterKey: true });
-
   if (!versionConfig) {
     return { 
         status: 'blocked', 
@@ -77,7 +53,6 @@ AV.Cloud.define('handshake', async (request) => {
         updateUrl: ''
     };
   }
-
   const status = versionConfig.get('status');
   if (status !== 'active') {
     return {
@@ -87,38 +62,47 @@ AV.Cloud.define('handshake', async (request) => {
       sessionAuthToken: null,
     };
   }
-
   const sessionAuthToken = crypto.randomBytes(32).toString('hex');
-  
   return {
     status: 'active',
     sessionAuthToken: sessionAuthToken,
   };
 });
 
-/**
- * @description 在用户登录前执行的钩子，用于校验 App 合法性。
- */
-AV.Cloud.beforeLogin(async (request) => {
-  validateSessionAuth(request);
+// 【已移除】 AV.Cloud.beforeLogin(...) 
+
+// 【新增】 代理登录函数
+AV.Cloud.define('proxyLogin', async (request) => {
+  validateSessionAuth(request); // 首先执行安全校验
+
+  const { email, password } = request.params;
+  if (!email || !password) {
+      throw new AV.Cloud.Error('邮箱和密码不能为空。', { code: 400 });
+  }
+
+  try {
+      const user = await AV.User.logInWithEmail(email, password);
+      return user.toJSON();
+  } catch (error) {
+      console.error(`用户登录失败:`, error);
+      // 返回与 LeanCloud 标准登录接口一致的错误信息
+      if (error.code === 210 || error.code === 211) { // 210: 密码错误, 211: 用户不存在
+          throw new AV.Cloud.Error('用户不存在或密码错误。', { code: 404 });
+      }
+      throw new AV.Cloud.Error('登录时发生未知错误。', { code: 500 });
+  }
 });
 
-/**
- * @description 代理用户注册的云函数，增加了安全校验。
- */
 AV.Cloud.define('proxySignUp', async (request) => {
   validateSessionAuth(request);
-
   const { username, password, email } = request.params;
   if (!username || !password || !email) {
     throw new AV.Cloud.Error('用户名、密码和邮箱不能为空。', { code: 400 });
   }
-
   const user = new AV.User();
   user.setUsername(username);
   user.setPassword(password);
   user.setEmail(email);
-
   try {
     const signedUpUser = await user.signUp();
     return signedUpUser.toJSON();
@@ -131,10 +115,12 @@ AV.Cloud.define('proxySignUp', async (request) => {
   }
 });
 
-
 // =================================================================
 // == 现有业务云函数 (已集成安全校验)
 // =================================================================
+
+// ... (您所有的其他云函数保持不变，此处省略以保持简洁)
+// ... (请确保您文件中的其他函数都存在)
 
 // --- 辅助函数：检查用户是否为管理员 ---
 const isAdmin = async (user) => {
@@ -869,5 +855,6 @@ AV.Cloud.define('migrateAllCharactersToOwner', async (request) => {
   console.log(resultMessage);
   return resultMessage;
 });
+
 
 module.exports = AV.Cloud;
