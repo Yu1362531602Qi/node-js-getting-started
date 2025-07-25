@@ -1,4 +1,4 @@
-// cloud.js (最终修复版 - 放开登录/注册的令牌校验)
+// cloud.js (最终修复版 - 移除代理函数，回归标准登录)
 
 'use strict';
 const AV = require('leanengine');
@@ -65,49 +65,7 @@ AV.Cloud.define('handshake', async (request) => {
   };
 });
 
-AV.Cloud.define('proxyLogin', async (request) => {
-  // 【核心修改】移除此处的令牌校验，允许任何通过握手的客户端尝试登录
-  // validateSessionAuth(request); 
-  
-  const { email, password } = request.params;
-  if (!email || !password) {
-      throw new AV.Cloud.Error('邮箱和密码不能为空。', { code: 400 });
-  }
-  try {
-      const user = await AV.User.loginWithEmail(email, password, { useMasterKey: true });
-      return user.toJSON();
-  } catch (error) {
-      console.error(`用户登录失败:`, error);
-      if (error.code === 210 || error.code === 211) {
-          throw new AV.Cloud.Error('用户不存在或密码错误。', { code: 404 });
-      }
-      throw new AV.Cloud.Error('登录时发生未知错误。', { code: 500 });
-  }
-});
-
-AV.Cloud.define('proxySignUp', async (request) => {
-  // 【核心修改】移除此处的令牌校验，允许任何通过握手的客户端尝试注册
-  // validateSessionAuth(request);
-
-  const { username, password, email } = request.params;
-  if (!username || !password || !email) {
-    throw new AV.Cloud.Error('用户名、密码和邮箱不能为空。', { code: 400 });
-  }
-  const user = new AV.User();
-  user.setUsername(username);
-  user.setPassword(password);
-  user.setEmail(email);
-  try {
-    const signedUpUser = await user.signUp();
-    return signedUpUser.toJSON();
-  } catch (error) {
-    console.error(`用户注册失败:`, error);
-    if (error.code === 202) throw new AV.Cloud.Error('该用户名已被使用。', { code: 409 });
-    if (error.code === 203) throw new AV.Cloud.Error('该邮箱已被注册。', { code: 409 });
-    if (error.code === 125) throw new AV.Cloud.Error('无效的邮箱地址。', { code: 400 });
-    throw new AV.Cloud.Error('注册时发生未知错误，请稍后再试。', { code: 500 });
-  }
-});
+// 【已删除】 proxyLogin 和 proxySignUp 函数
 
 // =================================================================
 // == 现有业务云函数 (已集成安全校验)
