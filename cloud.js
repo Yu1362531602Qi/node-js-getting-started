@@ -71,9 +71,10 @@ AV.Cloud.define('handshake', async (request) => {
 
 // 【已移除】 AV.Cloud.beforeLogin(...) 
 
-// 【新增】 代理登录函数
+// 【新增】 代理登录函数 (修复版)
 AV.Cloud.define('proxyLogin', async (request) => {
-  validateSessionAuth(request); // 首先执行安全校验
+  // 1. 仍然首先执行我们最重要的安全校验
+  validateSessionAuth(request);
 
   const { email, password } = request.params;
   if (!email || !password) {
@@ -81,7 +82,12 @@ AV.Cloud.define('proxyLogin', async (request) => {
   }
 
   try {
-      const user = await AV.User.logInWithEmail(email, password);
+      // 2. 【核心修改】使用 AV.User.loginWithEmail 方法，并明确传入 useMasterKey: true
+      // 这会绕过当前请求的用户上下文，直接使用最高权限进行登录验证。
+      // 因为我们已经在 validateSessionAuth 中确认了请求来自合法 App，所以这样做是安全的。
+      const user = await AV.User.loginWithEmail(email, password, { useMasterKey: true });
+      
+      // 3. 登录成功，返回用户信息和 sessionToken
       return user.toJSON();
   } catch (error) {
       console.error(`用户登录失败:`, error);
