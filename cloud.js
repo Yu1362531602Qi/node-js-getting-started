@@ -1,4 +1,4 @@
-// cloud.js (完整版，已修复 beforeLogin 错误并替换为 proxyLogin)
+// cloud.js (最终修复版 - 统一返回结构)
 
 'use strict';
 const AV = require('leanengine');
@@ -14,85 +14,88 @@ const validateSessionAuth = (request) => {
   if (!sessionAuthToken) {
     throw new AV.Cloud.Error('无效的客户端，禁止操作。', { code: 403 });
   }
-  const functionName = request.functionName || (request.object ? 'login' : 'unknown');
+  const functionName = request.functionName || 'unknown';
   console.log(`Session Auth Token 校验通过，函数: ${functionName}`);
 };
 
+/**
+ * @description 客户端启动时的安全握手函数 (重构版)
+ */
 AV.Cloud.define('handshake', async (request) => {
   const { version, timestamp, signature } = request.params;
+
   if (!version || !timestamp || !signature) {
     throw new AV.Cloud.Error('无效的握手请求，缺少参数。', { code: 400 });
   }
+
   const clientTimestamp = parseInt(timestamp, 10);
   const serverTimestamp = Math.floor(Date.now() / 1000);
+  
   if (Math.abs(serverTimestamp - clientTimestamp) > 300) {
-    console.warn(`拒绝过期的握手请求。服务器时间: ${serverTimestamp}, 客户端时间: ${clientTimestamp}`);
     throw new AV.Cloud.Error('请求已过期或设备时间不正确。', { code: 408 });
   }
+
   const rootKey = process.env.CLIENT_ROOT_KEY;
   if (!rootKey) {
       console.error('FATAL: 环境变量 CLIENT_ROOT_KEY 未设置！');
       throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
   }
+  
   const challengeData = `${version}|${timestamp}`;
   const hmac = crypto.createHmac('sha256', rootKey);
   hmac.update(challengeData);
   const serverSignature = hmac.digest('hex');
+
   if (serverSignature !== signature) {
     console.error(`签名验证失败！客户端签名: ${signature}, 服务器计算签名: ${serverSignature}`);
     throw new AV.Cloud.Error('签名验证失败。', { code: 403 });
   }
+
   console.log(`版本 ${version} 的客户端握手成功。`);
+
   const versionQuery = new AV.Query('VersionConfig');
   versionQuery.equalTo('versionName', version);
   const versionConfig = await versionQuery.first({ useMasterKey: true });
-  if (!versionConfig) {
-    return { 
-        status: 'blocked', 
-        updateMessage: '您的应用版本不受支持，请更新。', 
-        updateUrl: ''
-    };
+
+  // --- vvv 核心修改：统一返回结构 vvv ---
+  let status = 'blocked';
+  let updateMessage = '您的应用版本不受支持，请更新。';
+  let updateUrl = '';
+  let sessionAuthToken = null;
+
+  if (versionConfig) {
+    status = versionConfig.get('status');
+    updateMessage = versionConfig.get('updateMessage');
+    updateUrl = versionConfig.get('updateUrl');
   }
-  const status = versionConfig.get('status');
-  if (status !== 'active') {
-    return {
-      status: status,
-      updateMessage: versionConfig.get('updateMessage'),
-      updateUrl: versionConfig.get('updateUrl'),
-      sessionAuthToken: null,
-    };
+
+  if (status === 'active') {
+    // 只有在 status 明确为 'active' 时，才生成并下发令牌
+    sessionAuthToken = crypto.randomBytes(32).toString('hex');
   }
-  const sessionAuthToken = crypto.randomBytes(32).toString('hex');
+
+  // 永远返回一个结构完整的对象
   return {
-    status: 'active',
+    status: status,
+    updateMessage: updateMessage,
+    updateUrl: updateUrl,
     sessionAuthToken: sessionAuthToken,
   };
+  // --- ^^^ 核心修改 ^^^ ---
 });
 
-// 【已移除】 AV.Cloud.beforeLogin(...) 
-
-// 【新增】 代理登录函数 (修复版)
 AV.Cloud.define('proxyLogin', async (request) => {
-  // 1. 仍然首先执行我们最重要的安全校验
   validateSessionAuth(request);
-
   const { email, password } = request.params;
   if (!email || !password) {
       throw new AV.Cloud.Error('邮箱和密码不能为空。', { code: 400 });
   }
-
   try {
-      // 2. 【核心修改】使用 AV.User.loginWithEmail 方法，并明确传入 useMasterKey: true
-      // 这会绕过当前请求的用户上下文，直接使用最高权限进行登录验证。
-      // 因为我们已经在 validateSessionAuth 中确认了请求来自合法 App，所以这样做是安全的。
       const user = await AV.User.loginWithEmail(email, password, { useMasterKey: true });
-      
-      // 3. 登录成功，返回用户信息和 sessionToken
       return user.toJSON();
   } catch (error) {
       console.error(`用户登录失败:`, error);
-      // 返回与 LeanCloud 标准登录接口一致的错误信息
-      if (error.code === 210 || error.code === 211) { // 210: 密码错误, 211: 用户不存在
+      if (error.code === 210 || error.code === 211) {
           throw new AV.Cloud.Error('用户不存在或密码错误。', { code: 404 });
       }
       throw new AV.Cloud.Error('登录时发生未知错误。', { code: 500 });
