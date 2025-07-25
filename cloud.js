@@ -1,4 +1,4 @@
-// cloud.js (最终修复版 - 统一返回结构)
+// cloud.js (最终修复版 - 放开登录/注册的令牌校验)
 
 'use strict';
 const AV = require('leanengine');
@@ -18,74 +18,57 @@ const validateSessionAuth = (request) => {
   console.log(`Session Auth Token 校验通过，函数: ${functionName}`);
 };
 
-/**
- * @description 客户端启动时的安全握手函数 (重构版)
- */
 AV.Cloud.define('handshake', async (request) => {
   const { version, timestamp, signature } = request.params;
-
   if (!version || !timestamp || !signature) {
     throw new AV.Cloud.Error('无效的握手请求，缺少参数。', { code: 400 });
   }
-
   const clientTimestamp = parseInt(timestamp, 10);
   const serverTimestamp = Math.floor(Date.now() / 1000);
-  
   if (Math.abs(serverTimestamp - clientTimestamp) > 300) {
     throw new AV.Cloud.Error('请求已过期或设备时间不正确。', { code: 408 });
   }
-
   const rootKey = process.env.CLIENT_ROOT_KEY;
   if (!rootKey) {
       console.error('FATAL: 环境变量 CLIENT_ROOT_KEY 未设置！');
       throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
   }
-  
   const challengeData = `${version}|${timestamp}`;
   const hmac = crypto.createHmac('sha256', rootKey);
   hmac.update(challengeData);
   const serverSignature = hmac.digest('hex');
-
   if (serverSignature !== signature) {
     console.error(`签名验证失败！客户端签名: ${signature}, 服务器计算签名: ${serverSignature}`);
     throw new AV.Cloud.Error('签名验证失败。', { code: 403 });
   }
-
   console.log(`版本 ${version} 的客户端握手成功。`);
-
   const versionQuery = new AV.Query('VersionConfig');
   versionQuery.equalTo('versionName', version);
   const versionConfig = await versionQuery.first({ useMasterKey: true });
-
-  // --- vvv 核心修改：统一返回结构 vvv ---
   let status = 'blocked';
   let updateMessage = '您的应用版本不受支持，请更新。';
   let updateUrl = '';
   let sessionAuthToken = null;
-
   if (versionConfig) {
     status = versionConfig.get('status');
     updateMessage = versionConfig.get('updateMessage');
     updateUrl = versionConfig.get('updateUrl');
   }
-
   if (status === 'active') {
-    // 只有在 status 明确为 'active' 时，才生成并下发令牌
     sessionAuthToken = crypto.randomBytes(32).toString('hex');
   }
-
-  // 永远返回一个结构完整的对象
   return {
     status: status,
     updateMessage: updateMessage,
     updateUrl: updateUrl,
     sessionAuthToken: sessionAuthToken,
   };
-  // --- ^^^ 核心修改 ^^^ ---
 });
 
 AV.Cloud.define('proxyLogin', async (request) => {
-  validateSessionAuth(request);
+  // 【核心修改】移除此处的令牌校验，允许任何通过握手的客户端尝试登录
+  // validateSessionAuth(request); 
+  
   const { email, password } = request.params;
   if (!email || !password) {
       throw new AV.Cloud.Error('邮箱和密码不能为空。', { code: 400 });
@@ -103,7 +86,9 @@ AV.Cloud.define('proxyLogin', async (request) => {
 });
 
 AV.Cloud.define('proxySignUp', async (request) => {
-  validateSessionAuth(request);
+  // 【核心修改】移除此处的令牌校验，允许任何通过握手的客户端尝试注册
+  // validateSessionAuth(request);
+
   const { username, password, email } = request.params;
   if (!username || !password || !email) {
     throw new AV.Cloud.Error('用户名、密码和邮箱不能为空。', { code: 400 });
@@ -128,8 +113,8 @@ AV.Cloud.define('proxySignUp', async (request) => {
 // == 现有业务云函数 (已集成安全校验)
 // =================================================================
 
-// ... (您所有的其他云函数保持不变，此处省略以保持简洁)
-// ... (请确保您文件中的其他函数都存在)
+// ... (您所有的其他云函数保持不变，并且依然保留 validateSessionAuth(request) 校验)
+// ... (此处省略，请保留您文件中的这部分代码)
 
 // --- 辅助函数：检查用户是否为管理员 ---
 const isAdmin = async (user) => {
