@@ -1,8 +1,27 @@
-// cloud.js (已修复所有 JavaScript 语法错误)
+// cloud.js (已修复所有 JavaScript 语法错误并添加新功能)
 
 'use strict';
 const AV = require('leanengine');
 const qiniu = require('qiniu');
+const crypto = require('crypto'); // <-- 核心新增：引入加密模块
+
+// --- 辅助函数：版本比较 ---
+const isUpdateRequiredJS = (currentVersion, minVersion) => {
+  if (!minVersion) return false;
+  try {
+    const currentParts = currentVersion.split('.').map(Number);
+    const minParts = minVersion.split('.').map(Number);
+    for (let i = 0; i < minParts.length; i++) {
+      if (i >= currentParts.length) return true;
+      if (currentParts[i] < minParts[i]) return true;
+      if (currentParts[i] > minParts[i]) return false;
+    }
+    return false;
+  } catch (e) {
+    console.error(`版本号解析错误: current='${currentVersion}', min='${minVersion}'. 错误:`, e);
+    return false;
+  }
+};
 
 // --- 辅助函数：检查用户是否为管理员 ---
 const isAdmin = async (user) => {
@@ -14,11 +33,117 @@ const isAdmin = async (user) => {
   return count > 0;
 };
 
+// --- 核心新增：安全握手云函数 ---
+AV.Cloud.define('handshake', async (request) => {
+  console.log("接收到握手请求...");
+
+  // 1. 验证输入参数
+  const { challenge_code, signature, app_version } = request.params;
+  if (!challenge_code || !signature || !app_version) {
+    throw new AV.Cloud.Error('请求参数不完整。', { code: 400 });
+  }
+
+  // 2. 从环境变量获取根密钥
+  const rootKey = process.env.CLIENT_ROOT_KEY;
+  if (!rootKey) {
+    console.error('CRITICAL: 环境变量 CLIENT_ROOT_KEY 未设置！');
+    throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
+  }
+
+  // 3. 在服务器端重新计算签名
+  const hmac = crypto.createHmac('sha256', rootKey);
+  hmac.update(challenge_code);
+  const serverSignature = hmac.digest('hex');
+
+  // 4. 对比签名 (关键验证步骤)
+  if (serverSignature !== signature) {
+    console.warn(`签名验证失败！客户端签名: ${signature}, 服务器计算签名: ${serverSignature}`);
+    throw new AV.Cloud.Error('签名无效，请求被拒绝。', { code: 403 });
+  }
+  console.log("签名验证成功！");
+
+  // 5. 签名验证通过，开始版本检查
+  const versionQuery = new AV.Query('VersionConfig');
+  versionQuery.descending('createdAt'); // 获取最新的配置
+  const config = await versionQuery.first({ useMasterKey: true });
+
+  if (!config) {
+    console.error('未在 VersionConfig 表中找到任何配置。');
+    throw new AV.Cloud.Error('服务器缺少版本配置。', { code: 500 });
+  }
+
+  const minVersion = config.get('versionName'); // 从截图中看到字段名为 versionName
+  const status = config.get('status');
+  const updateMessage = config.get('updateMessage');
+  const updateUrl = config.get('updateUrl');
+
+  // 检查版本是否被禁用
+  if (status === 'blocked') {
+    return {
+      versionStatus: 'blocked',
+      message: updateMessage || '当前版本已停用，请更新至最新版本。',
+      url: updateUrl,
+    };
+  }
+
+  // 检查是否需要强制更新
+  if (isUpdateRequiredJS(app_version, minVersion)) {
+    return {
+      versionStatus: 'update_required',
+      message: updateMessage || '有新版本可用，请前往更新。',
+      url: updateUrl,
+    };
+  }
+
+  // 6. 版本检查通过，生成并存储会话令牌
+  const sessionApiToken = crypto.randomBytes(32).toString('hex');
+  const deviceIdMatch = /deviceId:([^;]+)/.exec(challenge_code);
+  const deviceId = deviceIdMatch ? deviceIdMatch[1] : 'unknown';
+  
+  const ApiSession = AV.Object.extend('ApiSession');
+  const session = new ApiSession();
+  
+  // 设置令牌有效期为 24 小时
+  const expiresAt = new Date();
+  expiresAt.setHours(expiresAt.getHours() + 24);
+
+  session.set('token', sessionApiToken);
+  session.set('deviceId', deviceId);
+  session.set('appVersion', app_version);
+  session.set('expiresAt', expiresAt);
+  
+  // 为会话令牌设置ACL，只有创建者（理论上是无）和管理员可读写
+  const acl = new AV.ACL();
+  acl.setPublicReadAccess(false);
+  acl.setPublicWriteAccess(false);
+  acl.setRoleReadAccess('Admin', true);
+  acl.setRoleWriteAccess('Admin', true);
+  session.setACL(acl);
+
+  await session.save(null, { useMasterKey: true });
+  console.log(`成功为设备 ${deviceId} 创建会话令牌。`);
+
+  // 7. 下发会话令牌和配置信息
+  // 注意：根据您的要求，此处暂时不下发 API Keys
+  return {
+    versionStatus: 'active',
+    sessionApiToken: sessionApiToken,
+    // 未来可以扩展，下发动态API Keys
+    // apiKeys: {
+    //   siliconflow: process.env.SILICONFLOW_API_KEY,
+    //   deepseek: process.env.DEEPSEEK_API_KEY,
+    //   ...
+    // },
+  };
+});
+
+
 AV.Cloud.define('hello', function(request) {
   return 'Hello world!';
 });
 
 // --- 用户与个人资料 ---
+// ... (您其他的云函数代码保持不变) ...
 AV.Cloud.define('updateUserProfile', async (request) => {
   const user = request.currentUser;
   if (!user) {
