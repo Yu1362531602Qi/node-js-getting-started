@@ -1,4 +1,4 @@
-// cloud.js (完整版，已修复 beforeLogin 错误并替换为 proxyLogin)
+// cloud.js (最终修复版 - 移除代理函数，回归标准登录)
 
 'use strict';
 const AV = require('leanengine');
@@ -14,7 +14,7 @@ const validateSessionAuth = (request) => {
   if (!sessionAuthToken) {
     throw new AV.Cloud.Error('无效的客户端，禁止操作。', { code: 403 });
   }
-  const functionName = request.functionName || (request.object ? 'login' : 'unknown');
+  const functionName = request.functionName || 'unknown';
   console.log(`Session Auth Token 校验通过，函数: ${functionName}`);
 };
 
@@ -26,7 +26,6 @@ AV.Cloud.define('handshake', async (request) => {
   const clientTimestamp = parseInt(timestamp, 10);
   const serverTimestamp = Math.floor(Date.now() / 1000);
   if (Math.abs(serverTimestamp - clientTimestamp) > 300) {
-    console.warn(`拒绝过期的握手请求。服务器时间: ${serverTimestamp}, 客户端时间: ${clientTimestamp}`);
     throw new AV.Cloud.Error('请求已过期或设备时间不正确。', { code: 408 });
   }
   const rootKey = process.env.CLIENT_ROOT_KEY;
@@ -46,81 +45,34 @@ AV.Cloud.define('handshake', async (request) => {
   const versionQuery = new AV.Query('VersionConfig');
   versionQuery.equalTo('versionName', version);
   const versionConfig = await versionQuery.first({ useMasterKey: true });
-  if (!versionConfig) {
-    return { 
-        status: 'blocked', 
-        updateMessage: '您的应用版本不受支持，请更新。', 
-        updateUrl: ''
-    };
+  let status = 'blocked';
+  let updateMessage = '您的应用版本不受支持，请更新。';
+  let updateUrl = '';
+  let sessionAuthToken = null;
+  if (versionConfig) {
+    status = versionConfig.get('status');
+    updateMessage = versionConfig.get('updateMessage');
+    updateUrl = versionConfig.get('updateUrl');
   }
-  const status = versionConfig.get('status');
-  if (status !== 'active') {
-    return {
-      status: status,
-      updateMessage: versionConfig.get('updateMessage'),
-      updateUrl: versionConfig.get('updateUrl'),
-      sessionAuthToken: null,
-    };
+  if (status === 'active') {
+    sessionAuthToken = crypto.randomBytes(32).toString('hex');
   }
-  const sessionAuthToken = crypto.randomBytes(32).toString('hex');
   return {
-    status: 'active',
+    status: status,
+    updateMessage: updateMessage,
+    updateUrl: updateUrl,
     sessionAuthToken: sessionAuthToken,
   };
 });
 
-// 【已移除】 AV.Cloud.beforeLogin(...) 
-
-// 【新增】 代理登录函数
-AV.Cloud.define('proxyLogin', async (request) => {
-  validateSessionAuth(request); // 首先执行安全校验
-
-  const { email, password } = request.params;
-  if (!email || !password) {
-      throw new AV.Cloud.Error('邮箱和密码不能为空。', { code: 400 });
-  }
-
-  try {
-      const user = await AV.User.logInWithEmail(email, password);
-      return user.toJSON();
-  } catch (error) {
-      console.error(`用户登录失败:`, error);
-      // 返回与 LeanCloud 标准登录接口一致的错误信息
-      if (error.code === 210 || error.code === 211) { // 210: 密码错误, 211: 用户不存在
-          throw new AV.Cloud.Error('用户不存在或密码错误。', { code: 404 });
-      }
-      throw new AV.Cloud.Error('登录时发生未知错误。', { code: 500 });
-  }
-});
-
-AV.Cloud.define('proxySignUp', async (request) => {
-  validateSessionAuth(request);
-  const { username, password, email } = request.params;
-  if (!username || !password || !email) {
-    throw new AV.Cloud.Error('用户名、密码和邮箱不能为空。', { code: 400 });
-  }
-  const user = new AV.User();
-  user.setUsername(username);
-  user.setPassword(password);
-  user.setEmail(email);
-  try {
-    const signedUpUser = await user.signUp();
-    return signedUpUser.toJSON();
-  } catch (error) {
-    console.error(`用户注册失败:`, error);
-    if (error.code === 202) throw new AV.Cloud.Error('该用户名已被使用。', { code: 409 });
-    if (error.code === 203) throw new AV.Cloud.Error('该邮箱已被注册。', { code: 409 });
-    if (error.code === 125) throw new AV.Cloud.Error('无效的邮箱地址。', { code: 400 });
-    throw new AV.Cloud.Error('注册时发生未知错误，请稍后再试。', { code: 500 });
-  }
-});
+// 【已删除】 proxyLogin 和 proxySignUp 函数
 
 // =================================================================
 // == 现有业务云函数 (已集成安全校验)
 // =================================================================
 
-// ... (您所有的其他云函数保持不变，此处省略以保持简洁)
-// ... (请确保您文件中的其他函数都存在)
+// ... (您所有的其他云函数保持不变，并且依然保留 validateSessionAuth(request) 校验)
+// ... (此处省略，请保留您文件中的这部分代码)
 
 // --- 辅助函数：检查用户是否为管理员 ---
 const isAdmin = async (user) => {
