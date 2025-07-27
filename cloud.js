@@ -1,4 +1,4 @@
-// cloud.js (V3.1 - 调试增强完整版)
+// cloud.js (V3.2 - Plan B 完整版, 使用 UserFollow 替代 Follow)
 
 'use strict';
 const AV = require('leanengine');
@@ -78,12 +78,11 @@ const isAdmin = async (user) => {
 
 // --- 辅助函数：获取用户角色列表 ---
 const getUserRoles = async (user) => {
-    if (!user) return ['User']; // 理论上不会发生，因为调用前会检查登录
+    if (!user) return ['User'];
     const roleQuery = new AV.Query(AV.Role);
     roleQuery.equalTo('users', user);
     const roles = await roleQuery.find({ useMasterKey: true });
     const roleNames = roles.map(role => role.get('name'));
-    // 如果用户没有任何角色，我们默认他是 'User'
     if (roleNames.length === 0 || !roleNames.includes('User')) {
         roleNames.push('User');
     }
@@ -171,7 +170,7 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
 });
 
 // =================================================================
-// == 现有业务云函数 (保持不变)
+// == 现有业务云函数
 // =================================================================
 
 AV.Cloud.define('hello', function(request) {
@@ -318,7 +317,7 @@ AV.Cloud.define('followUser', async (request) => {
   if (user.id === targetUserId) {
     throw new AV.Cloud.Error('不能关注自己。', { code: 400 });
   }
-  const followQuery = new AV.Query('Follow');
+  const followQuery = new AV.Query('UserFollow'); // 核心修改
   followQuery.equalTo('user', user);
   followQuery.equalTo('followed', AV.Object.createWithoutData('_User', targetUserId));
   const existingFollow = await followQuery.first();
@@ -326,7 +325,7 @@ AV.Cloud.define('followUser', async (request) => {
     console.log(`用户 ${user.id} 已关注 ${targetUserId}，无需重复操作。`);
     return { success: true, message: '已关注' };
   }
-  const Follow = AV.Object.extend('Follow');
+  const Follow = AV.Object.extend('UserFollow'); // 核心修改
   const newFollow = new Follow();
   newFollow.set('user', user);
   newFollow.set('followed', AV.Object.createWithoutData('_User', targetUserId));
@@ -352,7 +351,7 @@ AV.Cloud.define('unfollowUser', async (request) => {
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
   }
-  const followQuery = new AV.Query('Follow');
+  const followQuery = new AV.Query('UserFollow'); // 核心修改
   followQuery.equalTo('user', user);
   followQuery.equalTo('followed', AV.Object.createWithoutData('_User', targetUserId));
   const followRecord = await followQuery.first();
@@ -375,7 +374,7 @@ AV.Cloud.define('getFollowers', async (request) => {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
   }
   const targetUser = AV.Object.createWithoutData('_User', targetUserId);
-  const query = new AV.Query('Follow');
+  const query = new AV.Query('UserFollow'); // 核心修改
   query.equalTo('followed', targetUser);
   query.include('user');
   query.select('user.username', 'user.avatarUrl', 'user.objectId');
@@ -393,7 +392,7 @@ AV.Cloud.define('getFollowing', async (request) => {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
   }
   const targetUser = AV.Object.createWithoutData('_User', targetUserId);
-  const query = new AV.Query('Follow');
+  const query = new AV.Query('UserFollow'); // 核心修改
   query.equalTo('user', targetUser);
   query.include('followed');
   query.select('followed.username', 'followed.avatarUrl', 'followed.objectId');
@@ -620,7 +619,7 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
   };
   let isFollowing = false;
   if (currentUser && currentUser.id !== userId) {
-    const followQuery = new AV.Query('Follow');
+    const followQuery = new AV.Query('UserFollow'); // 核心修改
     followQuery.equalTo('user', currentUser);
     followQuery.equalTo('followed', user);
     const followRecord = await followQuery.first();
@@ -912,7 +911,6 @@ AV.Cloud.afterSave('_User', async (request) => {
       } else {
         console.error('FATAL: The "User" role was not found. Could not assign role to new user.');
         
-        // 额外调试：查询所有角色，看看究竟有什么
         const allRolesQuery = new AV.Query(AV.Role);
         const allRoles = await allRolesQuery.find({ useMasterKey: true });
         const allRoleNames = allRoles.map(r => r.get('name'));
