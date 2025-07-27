@@ -1,9 +1,44 @@
-// cloud.js (V2 - 集成 API 调用次数限制)
+// cloud.js (V3 - 最终修复版，新用户自动加入角色)
 
 'use strict';
 const AV = require('leanengine');
 const qiniu = require('qiniu');
 const crypto = require('crypto');
+
+// =================================================================
+// == vvv 核心新增：_User表的afterSave钩子 vvv
+// =================================================================
+/**
+ * 在新用户创建成功后，自动将其添加到 "User" 角色中
+ */
+AV.Cloud.afterSave('_User', async (request) => {
+  // request.object 是新创建的 _User 对象
+  const user = request.object;
+
+  // isNew() 方法判断这是否是一个新建的对象
+  if (user.isNew()) {
+    console.log(`新用户注册成功: ${user.get('username')} (ID: ${user.id})，准备添加到 'User' 角色。`);
+    try {
+      // 1. 查询名为 "User" 的角色
+      const roleQuery = new AV.Query(AV.Role);
+      roleQuery.equalTo('name', 'User');
+      const userRole = await roleQuery.first({ useMasterKey: true });
+
+      if (userRole) {
+        // 2. 如果角色存在，则将新用户添加到该角色的用户列表中
+        const relation = userRole.getUsers();
+        relation.add(user);
+        await userRole.save(null, { useMasterKey: true });
+        console.log(`成功将用户 ${user.id} 添加到 'User' 角色。`);
+      } else {
+        console.error("严重错误：系统中未找到名为 'User' 的角色，无法为新用户分配默认角色。请在 _Role 表中创建。");
+      }
+    } catch (error) {
+      console.error(`为新用户 ${user.id} 添加到 'User' 角色时失败:`, error);
+    }
+  }
+});
+
 
 // =================================================================
 // == 安全校验核心模块
@@ -76,33 +111,27 @@ const isAdmin = async (user) => {
   return count > 0;
 };
 
-// --- 辅助函数：获取用户角色列表 ---
+// --- 辅助函数：获取用户角色列表 (现在更可靠了) ---
 const getUserRoles = async (user) => {
-    if (!user) return ['User']; // 理论上不会发生，因为调用前会检查登录
+    if (!user) return ['User']; 
     const roleQuery = new AV.Query(AV.Role);
     roleQuery.equalTo('users', user);
     const roles = await roleQuery.find({ useMasterKey: true });
     const roleNames = roles.map(role => role.get('name'));
-    // 如果用户没有任何角色，我们默认他是 'User'
-    if (roleNames.length === 0 || !roleNames.includes('User')) {
-        roleNames.push('User');
+    // 因为 afterSave 钩子确保了新用户至少有 'User' 角色，这里的逻辑可以简化
+    // 但为了健壮性，我们仍然保留一个默认值
+    if (roleNames.length === 0) {
+        return ['User'];
     }
     return roleNames;
 };
 
 
 // =================================================================
-// == vvv 核心新增：API 调用限制模块 vvv
+// == API 调用限制模块
 // =================================================================
 
-/**
- * 检查并增加用户API使用次数的内部核心函数
- * @param {AV.User} user - 当前用户对象
- * @param {'llm' | 'tts'} usageType - 使用类型 ('llm' 或 'tts')
- * @returns {Promise<void>} - 如果超出限制则抛出异常
- */
 async function checkAndIncrementUsage(user, usageType) {
-    // 1. 获取今天的日期字符串 (UTC时区，确保全球用户日期一致)
     const today = new Date().toISOString().slice(0, 10);
     const lastCallDate = user.get('lastCallDate');
 
@@ -110,17 +139,15 @@ async function checkAndIncrementUsage(user, usageType) {
     let currentUsage = user.get(usageCountField) || 0;
     let needsSave = false;
 
-    // 2. 如果最后调用日期不是今天，重置所有计数器
     if (lastCallDate !== today) {
         console.log(`用户 ${user.id} 在新的一天 (${today}) 首次调用，重置所有计数器。`);
         user.set('lastCallDate', today);
         user.set('llmCallCount', 0);
         user.set('ttsCallCount', 0);
-        currentUsage = 0; // 当前类型的用量也归零
+        currentUsage = 0;
         needsSave = true;
     }
 
-    // 3. 获取用户角色并确定其最高限额
     const userRoles = await getUserRoles(user);
     
     const permissionQuery = new AV.Query('RolePermission');
@@ -133,21 +160,17 @@ async function checkAndIncrementUsage(user, usageType) {
     }
 
     const limitField = `${usageType}Limit`;
-    // 找出用户所有角色中最高的限额
     const dailyLimit = Math.max(...permissions.map(p => p.get(limitField) || 0));
 
     console.log(`用户 ${user.id} (角色: ${userRoles.join(', ')}) 的 ${usageType} 限额为 ${dailyLimit}，当前已用 ${currentUsage}`);
 
-    // 4. 检查是否超出限制
     if (currentUsage >= dailyLimit) {
         throw new AV.Cloud.Error(`您今日的${usageType === 'llm' ? '语言模型' : '语音'}调用次数已达上限 (${dailyLimit}次)。`, { code: 429 });
     }
 
-    // 5. 增加计数
     user.increment(usageCountField, 1);
     needsSave = true;
     
-    // 6. 如果有任何更改，则保存
     if (needsSave) {
         try {
             await user.save(null, { useMasterKey: true });
@@ -159,9 +182,6 @@ async function checkAndIncrementUsage(user, usageType) {
     }
 }
 
-/**
- * 请求 API 调用许可的云函数 (轻量级方案)
- */
 AV.Cloud.define('requestApiCallPermission', async (request) => {
     validateSessionAuth(request);
     const user = request.currentUser;
@@ -169,7 +189,6 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
     }
 
-    // 管理员直接放行，不计数
     if (await isAdmin(user)) {
         console.log(`管理员 ${user.get('username')} 请求调用许可，直接通过。`);
         return { canCall: true, message: '管理员权限，许可已授予。' };
@@ -185,7 +204,6 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         return { canCall: true, message: '许可已授予。' };
     } catch (error) {
         console.log(`用户 ${user.id} 的 ${usageType} 调用被拒绝: ${error.message}`);
-        // 将 checkAndIncrementUsage 抛出的错误信息友好地返回给客户端
         return { canCall: false, message: error.message };
     }
 });
