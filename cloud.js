@@ -1,4 +1,4 @@
-// cloud.js (V3.5 - 最终修正版，添加 persistentNotifyUrl 解决 invalid_param 问题)
+// cloud.js (V3.2 - Plan B 完整版, 使用 UserFollow 替代 Follow)
 
 'use strict';
 const AV = require('leanengine');
@@ -317,7 +317,7 @@ AV.Cloud.define('followUser', async (request) => {
   if (user.id === targetUserId) {
     throw new AV.Cloud.Error('不能关注自己。', { code: 400 });
   }
-  const followQuery = new AV.Query('UserFollow');
+  const followQuery = new AV.Query('UserFollow'); // 核心修改
   followQuery.equalTo('user', user);
   followQuery.equalTo('followed', AV.Object.createWithoutData('_User', targetUserId));
   const existingFollow = await followQuery.first();
@@ -325,7 +325,7 @@ AV.Cloud.define('followUser', async (request) => {
     console.log(`用户 ${user.id} 已关注 ${targetUserId}，无需重复操作。`);
     return { success: true, message: '已关注' };
   }
-  const Follow = AV.Object.extend('UserFollow');
+  const Follow = AV.Object.extend('UserFollow'); // 核心修改
   const newFollow = new Follow();
   newFollow.set('user', user);
   newFollow.set('followed', AV.Object.createWithoutData('_User', targetUserId));
@@ -351,7 +351,7 @@ AV.Cloud.define('unfollowUser', async (request) => {
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
   }
-  const followQuery = new AV.Query('UserFollow');
+  const followQuery = new AV.Query('UserFollow'); // 核心修改
   followQuery.equalTo('user', user);
   followQuery.equalTo('followed', AV.Object.createWithoutData('_User', targetUserId));
   const followRecord = await followQuery.first();
@@ -374,7 +374,7 @@ AV.Cloud.define('getFollowers', async (request) => {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
   }
   const targetUser = AV.Object.createWithoutData('_User', targetUserId);
-  const query = new AV.Query('UserFollow');
+  const query = new AV.Query('UserFollow'); // 核心修改
   query.equalTo('followed', targetUser);
   query.include('user');
   query.select('user.username', 'user.avatarUrl', 'user.objectId');
@@ -392,7 +392,7 @@ AV.Cloud.define('getFollowing', async (request) => {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
   }
   const targetUser = AV.Object.createWithoutData('_User', targetUserId);
-  const query = new AV.Query('UserFollow');
+  const query = new AV.Query('UserFollow'); // 核心修改
   query.equalTo('user', targetUser);
   query.include('followed');
   query.select('followed.username', 'followed.avatarUrl', 'followed.objectId');
@@ -490,36 +490,25 @@ AV.Cloud.define('incrementChatCount', async (request) => {
 
 AV.Cloud.define('getQiniuUploadToken', async (request) => {
   validateSessionAuth(request);
-  const user = request.currentUser;
-  if (!user) {
-    throw new AV.Cloud.Error('用户未登录，禁止获取上传凭证。', { code: 401 });
-  }
   const accessKey = process.env.QINIU_AK;
   const secretKey = process.env.QINIU_SK;
   const bucket = process.env.QINIU_BUCKET_NAME;
+  if (!request.currentUser) {
+    throw new AV.Cloud.Error('用户未登录，禁止获取上传凭证。', { code: 401 });
+  }
   if (!accessKey || !secretKey || !bucket) {
     console.error('七牛云环境变量未完全设置 (QINIU_AK, QINIU_SK, QINIU_BUCKET_NAME)');
     throw new AV.Cloud.Error('服务器配置错误，无法生成上传凭证。', { code: 500 });
   }
   const mac = new qiniu.auth.digest.Mac(accessKey, secretKey);
-
-  const originalKey = `uploads/characters/${user.id}/${Date.now()}_original.jpg`;
-  const saveAsKey = `processed/characters/$(etag)$(ext)`; 
-  const fops = 'imageView2/2/w/600/h/900/format/jpg/q/80|imageslim';
-
   const options = {
-    scope: `${bucket}:${originalKey}`,
+    scope: bucket,
     expires: 3600,
-    persistentOps: `${fops}|saveas/${qiniu.util.urlsafeBase64Encode(`${bucket}:${saveAsKey}`)}`,
-    persistentPipeline: 'default-pipeline', 
-    persistentNotifyUrl: 'http://www.example.com/qiniu/notify', 
   };
-
   const putPolicy = new qiniu.rs.PutPolicy(options);
   const uploadToken = putPolicy.uploadToken(mac);
-  
   if (uploadToken) {
-    return { token: uploadToken, key: originalKey };
+    return { token: uploadToken };
   } else {
     throw new AV.Cloud.Error('生成上传凭证失败。', { code: 500 });
   }
@@ -630,7 +619,7 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
   };
   let isFollowing = false;
   if (currentUser && currentUser.id !== userId) {
-    const followQuery = new AV.Query('UserFollow');
+    const followQuery = new AV.Query('UserFollow'); // 核心修改
     followQuery.equalTo('user', currentUser);
     followQuery.equalTo('followed', user);
     const followRecord = await followQuery.first();
