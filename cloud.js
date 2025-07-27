@@ -1,9 +1,11 @@
-// cloud.js (V3.3 - 增加了角色卡图片上传时的自动压缩优化)
+// cloud.js (V3.4 - 修正了图片压缩上传策略的参数问题)
 
 'use strict';
 const AV = require('leanengine');
 const qiniu = require('qiniu');
 const crypto = require('crypto');
+
+// ... (其他所有代码保持不变，从 validateSessionAuth 到 incrementChatCount)
 
 // =================================================================
 // == 安全校验核心模块
@@ -488,51 +490,50 @@ AV.Cloud.define('incrementChatCount', async (request) => {
   }
 });
 
+// --- vvv 核心修改：修正 getQiniuUploadToken 函数 vvv ---
 AV.Cloud.define('getQiniuUploadToken', async (request) => {
   validateSessionAuth(request);
+  const user = request.currentUser;
+  if (!user) {
+    throw new AV.Cloud.Error('用户未登录，禁止获取上传凭证。', { code: 401 });
+  }
   const accessKey = process.env.QINIU_AK;
   const secretKey = process.env.QINIU_SK;
   const bucket = process.env.QINIU_BUCKET_NAME;
-  if (!request.currentUser) {
-    throw new AV.Cloud.Error('用户未登录，禁止获取上传凭证。', { code: 401 });
-  }
   if (!accessKey || !secretKey || !bucket) {
     console.error('七牛云环境变量未完全设置 (QINIU_AK, QINIU_SK, QINIU_BUCKET_NAME)');
     throw new AV.Cloud.Error('服务器配置错误，无法生成上传凭证。', { code: 500 });
   }
   const mac = new qiniu.auth.digest.Mac(accessKey, secretKey);
 
-  // --- vvv 核心修改：添加图片压缩与持久化处理指令 vvv ---
-  // 定义处理后文件的保存路径和名称, $(etag) 是文件的哈希值，保证唯一性
-  const saveAsKey = 'processed/characters/$(etag)$(ext)'; 
+  // 1. 为即将上传的原图预先生成一个唯一的 key (文件名)
+  const originalKey = `uploads/characters/${user.id}/${Date.now()}_original.jpg`;
+
+  // 2. 定义处理后文件的保存路径和名称
+  const saveAsKey = `processed/characters/$(etag)$(ext)`; 
   
-  // 定义处理指令：
-  // 1. imageView2: 缩放图片，模式2为等比缩放
-  // 2. w/600/h/900: 最大宽度600，最大高度900
-  // 3. format/jpg: 统一转换为jpg格式
-  // 4. q/80: jpg质量设置为80（高质量和文件大小的良好平衡点）
-  // 5. imageslim: 七牛云的智能压缩，进一步优化体积
+  // 3. 定义处理指令
   const fops = 'imageView2/2/w/600/h/900/format/jpg/q/80|imageslim';
 
   const options = {
-    scope: bucket,
+    // 4. 关键：scope 必须明确指定到具体的文件名
+    scope: `${bucket}:${originalKey}`,
     expires: 3600,
-    // 关键：设置持久化处理指令
     persistentOps: `${fops}|saveas/${qiniu.util.urlsafeBase64Encode(`${bucket}:${saveAsKey}`)}`,
-    // 关键：指定处理队列，'default-pipeline'是默认值
     persistentPipeline: 'default-pipeline', 
   };
-  // --- ^^^ 核心修改 ^^^ ---
 
   const putPolicy = new qiniu.rs.PutPolicy(options);
   const uploadToken = putPolicy.uploadToken(mac);
   
   if (uploadToken) {
-    return { token: uploadToken };
+    // 5. 关键：将预先生成的 key 也返回给客户端
+    return { token: uploadToken, key: originalKey };
   } else {
     throw new AV.Cloud.Error('生成上传凭证失败。', { code: 500 });
   }
 });
+// --- ^^^ 核心修改 ^^^ ---
 
 AV.Cloud.define('getSubmissionStatuses', async (request) => {
   validateSessionAuth(request);
@@ -557,6 +558,7 @@ AV.Cloud.define('getSubmissionStatuses', async (request) => {
   return statuses;
 });
 
+// ... (其他所有代码保持不变，从 searchPublicContent 到文件末尾)
 // --- 搜索功能 ---
 AV.Cloud.define('searchPublicContent', async (request) => {
   validateSessionAuth(request);
