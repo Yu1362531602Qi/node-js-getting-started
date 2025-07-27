@@ -1,4 +1,4 @@
-// cloud.js (V3 - 最终完整版，集成自动角色分配)
+// cloud.js (V3.1 - 调试增强完整版)
 
 'use strict';
 const AV = require('leanengine');
@@ -882,35 +882,44 @@ AV.Cloud.define('migrateAllCharactersToOwner', async (request) => {
 });
 
 // =================================================================
-// == Cloud Hook - 新用户自动加入角色
+// == Cloud Hook - 新用户自动加入角色 (调试增强版)
 // =================================================================
 
-/**
- * 在 _User 对象保存成功后触发
- * 用于将新注册的用户自动添加到 'User' 角色中
- */
 AV.Cloud.afterSave('_User', async (request) => {
   const newUser = request.object;
 
   if (newUser.isNew()) {
-    console.log(`afterSave hook triggered for new user, objectId: ${newUser.id}`);
+    console.log(`[DEBUG] afterSave Hook triggered for new user, objectId: ${newUser.id}`);
 
     const roleQuery = new AV.Query(AV.Role);
     roleQuery.equalTo('name', 'User');
     
     try {
+      console.log('[DEBUG] Step 1: Querying for role with name "User"...');
       const userRole = await roleQuery.first({ useMasterKey: true });
 
       if (userRole) {
+        console.log(`[DEBUG] Step 2: Found role "User" with objectId: ${userRole.id}`);
         const relation = userRole.relation('users');
+        
+        console.log(`[DEBUG] Step 3: Adding new user ${newUser.id} to the role relation...`);
         relation.add(newUser);
+        
+        console.log('[DEBUG] Step 4: Saving the role object...');
         await userRole.save(null, { useMasterKey: true });
-        console.log(`Successfully added new user ${newUser.id} to the 'User' role.`);
+        
+        console.log(`[SUCCESS] Successfully added new user ${newUser.id} to the 'User' role.`);
       } else {
         console.error('FATAL: The "User" role was not found. Could not assign role to new user.');
+        
+        // 额外调试：查询所有角色，看看究竟有什么
+        const allRolesQuery = new AV.Query(AV.Role);
+        const allRoles = await allRolesQuery.find({ useMasterKey: true });
+        const allRoleNames = allRoles.map(r => r.get('name'));
+        console.error(`[DEBUG] All existing roles in _Role table are: [${allRoleNames.join(', ')}]`);
       }
     } catch (error) {
-      console.error(`Error adding user to role in afterSave hook: ${error}`);
+      console.error(`[ERROR] An error occurred while adding user to role in afterSave hook: ${error}`);
     }
   }
 });
