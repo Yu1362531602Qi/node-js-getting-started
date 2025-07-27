@@ -1,4 +1,4 @@
-// cloud.js (V3.2 - Plan B 完整版, 使用 UserFollow 替代 Follow)
+// cloud.js (V3.3 - 增加历史对话轮数限制)
 
 'use strict';
 const AV = require('leanengine');
@@ -94,7 +94,7 @@ const getUserRoles = async (user) => {
 // == API 调用限制模块
 // =================================================================
 
-async function checkAndIncrementUsage(user, usageType) {
+async function checkAndIncrementUsage(user, usageType, permissions) {
     const today = new Date().toISOString().slice(0, 10);
     const lastCallDate = user.get('lastCallDate');
     const usageCountField = `${usageType}CallCount`;
@@ -110,18 +110,9 @@ async function checkAndIncrementUsage(user, usageType) {
         needsSave = true;
     }
 
-    const userRoles = await getUserRoles(user);
-    const permissionQuery = new AV.Query('RolePermission');
-    permissionQuery.containedIn('roleName', userRoles);
-    const permissions = await permissionQuery.find({ useMasterKey: true });
-
-    if (permissions.length === 0) {
-        console.error(`未找到任何与用户角色 ${userRoles.join(', ')} 匹配的权限配置！`);
-        throw new AV.Cloud.Error('服务器权限配置错误，请联系管理员。', { code: 500 });
-    }
-
     const limitField = `${usageType}Limit`;
     const dailyLimit = Math.max(...permissions.map(p => p.get(limitField) || 0));
+    const userRoles = permissions.map(p => p.get('roleName'));
 
     console.log(`用户 ${user.id} (角色: ${userRoles.join(', ')}) 的 ${usageType} 限额为 ${dailyLimit}，当前已用 ${currentUsage}`);
 
@@ -143,6 +134,7 @@ async function checkAndIncrementUsage(user, usageType) {
     }
 }
 
+// --- vvv 核心修改：requestApiCallPermission 函数 vvv ---
 AV.Cloud.define('requestApiCallPermission', async (request) => {
     validateSessionAuth(request);
     const user = request.currentUser;
@@ -150,9 +142,14 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
     }
 
+    // 1. 管理员直接拥有无限权限
     if (await isAdmin(user)) {
         console.log(`管理员 ${user.get('username')} 请求调用许可，直接通过。`);
-        return { canCall: true, message: '管理员权限，许可已授予。' };
+        return { 
+            canCall: true, 
+            message: '管理员权限，许可已授予。',
+            historyLimit: -1 // -1 代表无限制
+        };
     }
 
     const { usageType } = request.params;
@@ -160,17 +157,45 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         throw new AV.Cloud.Error('无效的 usageType 参数，必须是 "llm" 或 "tts"。', { code: 400 });
     }
 
+    // 2. 获取用户角色和对应的权限配置
+    const userRoles = await getUserRoles(user);
+    const permissionQuery = new AV.Query('RolePermission');
+    permissionQuery.containedIn('roleName', userRoles);
+    const permissions = await permissionQuery.find({ useMasterKey: true });
+
+    if (permissions.length === 0) {
+        console.error(`未找到任何与用户角色 ${userRoles.join(', ')} 匹配的权限配置！`);
+        throw new AV.Cloud.Error('服务器权限配置错误，请联系管理员。', { code: 500 });
+    }
+
+    // 3. 计算历史对话轮数限制 (取用户所有角色中最高的那个值)
+    // 如果 historyLimit 字段不存在，则默认为 15
+    const historyLimit = Math.max(...permissions.map(p => p.get('historyLimit') ?? 15));
+
+    // 4. 检查并增加每日调用次数
     try {
-        await checkAndIncrementUsage(user, usageType);
-        return { canCall: true, message: '许可已授予。' };
+        await checkAndIncrementUsage(user, usageType, permissions);
+        // 5. 如果检查通过，返回成功以及计算出的历史轮数限制
+        return { 
+            canCall: true, 
+            message: '许可已授予。',
+            historyLimit: historyLimit 
+        };
     } catch (error) {
         console.log(`用户 ${user.id} 的 ${usageType} 调用被拒绝: ${error.message}`);
-        return { canCall: false, message: error.message };
+        // 6. 如果检查不通过，返回失败
+        return { 
+            canCall: false, 
+            message: error.message,
+            historyLimit: 0 // 调用被拒绝时，轮数限制为0
+        };
     }
 });
+// --- ^^^ 核心修改 ^^^ ---
+
 
 // =================================================================
-// == 现有业务云函数
+// == 现有业务云函数 (无需修改，保持原样)
 // =================================================================
 
 AV.Cloud.define('hello', function(request) {
