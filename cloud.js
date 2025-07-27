@@ -1,4 +1,4 @@
-// cloud.js (最终修复版 - 移除代理函数，回归标准登录)
+// cloud.js (V2 - 集成 API 调用次数限制)
 
 'use strict';
 const AV = require('leanengine');
@@ -65,14 +65,6 @@ AV.Cloud.define('handshake', async (request) => {
   };
 });
 
-// 【已删除】 proxyLogin 和 proxySignUp 函数
-
-// =================================================================
-// == 现有业务云函数 (已集成安全校验)
-// =================================================================
-
-// ... (您所有的其他云函数保持不变，并且依然保留 validateSessionAuth(request) 校验)
-// ... (此处省略，请保留您文件中的这部分代码)
 
 // --- 辅助函数：检查用户是否为管理员 ---
 const isAdmin = async (user) => {
@@ -84,6 +76,126 @@ const isAdmin = async (user) => {
   return count > 0;
 };
 
+// --- 辅助函数：获取用户角色列表 ---
+const getUserRoles = async (user) => {
+    if (!user) return ['User']; // 理论上不会发生，因为调用前会检查登录
+    const roleQuery = new AV.Query(AV.Role);
+    roleQuery.equalTo('users', user);
+    const roles = await roleQuery.find({ useMasterKey: true });
+    const roleNames = roles.map(role => role.get('name'));
+    // 如果用户没有任何角色，我们默认他是 'User'
+    if (roleNames.length === 0 || !roleNames.includes('User')) {
+        roleNames.push('User');
+    }
+    return roleNames;
+};
+
+
+// =================================================================
+// == vvv 核心新增：API 调用限制模块 vvv
+// =================================================================
+
+/**
+ * 检查并增加用户API使用次数的内部核心函数
+ * @param {AV.User} user - 当前用户对象
+ * @param {'llm' | 'tts'} usageType - 使用类型 ('llm' 或 'tts')
+ * @returns {Promise<void>} - 如果超出限制则抛出异常
+ */
+async function checkAndIncrementUsage(user, usageType) {
+    // 1. 获取今天的日期字符串 (UTC时区，确保全球用户日期一致)
+    const today = new Date().toISOString().slice(0, 10);
+    const lastCallDate = user.get('lastCallDate');
+
+    const usageCountField = `${usageType}CallCount`;
+    let currentUsage = user.get(usageCountField) || 0;
+    let needsSave = false;
+
+    // 2. 如果最后调用日期不是今天，重置所有计数器
+    if (lastCallDate !== today) {
+        console.log(`用户 ${user.id} 在新的一天 (${today}) 首次调用，重置所有计数器。`);
+        user.set('lastCallDate', today);
+        user.set('llmCallCount', 0);
+        user.set('ttsCallCount', 0);
+        currentUsage = 0; // 当前类型的用量也归零
+        needsSave = true;
+    }
+
+    // 3. 获取用户角色并确定其最高限额
+    const userRoles = await getUserRoles(user);
+    
+    const permissionQuery = new AV.Query('RolePermission');
+    permissionQuery.containedIn('roleName', userRoles);
+    const permissions = await permissionQuery.find({ useMasterKey: true });
+
+    if (permissions.length === 0) {
+        console.error(`未找到任何与用户角色 ${userRoles.join(', ')} 匹配的权限配置！`);
+        throw new AV.Cloud.Error('服务器权限配置错误，请联系管理员。', { code: 500 });
+    }
+
+    const limitField = `${usageType}Limit`;
+    // 找出用户所有角色中最高的限额
+    const dailyLimit = Math.max(...permissions.map(p => p.get(limitField) || 0));
+
+    console.log(`用户 ${user.id} (角色: ${userRoles.join(', ')}) 的 ${usageType} 限额为 ${dailyLimit}，当前已用 ${currentUsage}`);
+
+    // 4. 检查是否超出限制
+    if (currentUsage >= dailyLimit) {
+        throw new AV.Cloud.Error(`您今日的${usageType === 'llm' ? '语言模型' : '语音'}调用次数已达上限 (${dailyLimit}次)。`, { code: 429 });
+    }
+
+    // 5. 增加计数
+    user.increment(usageCountField, 1);
+    needsSave = true;
+    
+    // 6. 如果有任何更改，则保存
+    if (needsSave) {
+        try {
+            await user.save(null, { useMasterKey: true });
+            console.log(`用户 ${user.id} 的 ${usageCountField} 计数更新成功。`);
+        } catch (error) {
+            console.error(`为用户 ${user.id} 更新用量计数失败:`, error);
+            throw new AV.Cloud.Error('更新用户用量失败，请重试。', { code: 500 });
+        }
+    }
+}
+
+/**
+ * 请求 API 调用许可的云函数 (轻量级方案)
+ */
+AV.Cloud.define('requestApiCallPermission', async (request) => {
+    validateSessionAuth(request);
+    const user = request.currentUser;
+    if (!user) {
+        throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
+    }
+
+    // 管理员直接放行，不计数
+    if (await isAdmin(user)) {
+        console.log(`管理员 ${user.get('username')} 请求调用许可，直接通过。`);
+        return { canCall: true, message: '管理员权限，许可已授予。' };
+    }
+
+    const { usageType } = request.params;
+    if (usageType !== 'llm' && usageType !== 'tts') {
+        throw new AV.Cloud.Error('无效的 usageType 参数，必须是 "llm" 或 "tts"。', { code: 400 });
+    }
+
+    try {
+        await checkAndIncrementUsage(user, usageType);
+        return { canCall: true, message: '许可已授予。' };
+    } catch (error) {
+        console.log(`用户 ${user.id} 的 ${usageType} 调用被拒绝: ${error.message}`);
+        // 将 checkAndIncrementUsage 抛出的错误信息友好地返回给客户端
+        return { canCall: false, message: error.message };
+    }
+});
+
+// =================================================================
+// == 现有业务云函数 (保持不变)
+// =================================================================
+
+// ... (您所有的其他云函数，如 updateUserProfile, followUser 等，都保持原样)
+// ... (为了简洁，这里省略了它们，请确保您的文件中保留了这些函数)
 AV.Cloud.define('hello', function(request) {
   return 'Hello world!';
 });
@@ -577,11 +689,10 @@ AV.Cloud.define('getUserCreations', async (request) => {
 
 
 // =================================================================
-// == 管理员后台功能 (这些函数通常由后台调用，不强制要求会话令牌)
+// == 管理员后台功能
 // =================================================================
 
-// ... (您原有的所有管理员函数，如 publishApprovedCharacters, batchAddOfficialCharacters 等，保持不变)
-// ... (此处省略，以保持代码简洁，请保留您文件中的这部分代码)
+// ... (您原有的所有管理员函数保持不变)
 AV.Cloud.define('publishApprovedCharacters', async (request) => {
   const submissionQuery = new AV.Query('CharacterSubmissions');
   submissionQuery.equalTo('status', 'approved');
