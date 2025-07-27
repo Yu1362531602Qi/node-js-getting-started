@@ -1,44 +1,9 @@
-// cloud.js (V3 - 最终修复版，新用户自动加入角色)
+// cloud.js (V3 - 最终完整版，集成自动角色分配)
 
 'use strict';
 const AV = require('leanengine');
 const qiniu = require('qiniu');
 const crypto = require('crypto');
-
-// =================================================================
-// == vvv 核心新增：_User表的afterSave钩子 vvv
-// =================================================================
-/**
- * 在新用户创建成功后，自动将其添加到 "User" 角色中
- */
-AV.Cloud.afterSave('_User', async (request) => {
-  // request.object 是新创建的 _User 对象
-  const user = request.object;
-
-  // isNew() 方法判断这是否是一个新建的对象
-  if (user.isNew()) {
-    console.log(`新用户注册成功: ${user.get('username')} (ID: ${user.id})，准备添加到 'User' 角色。`);
-    try {
-      // 1. 查询名为 "User" 的角色
-      const roleQuery = new AV.Query(AV.Role);
-      roleQuery.equalTo('name', 'User');
-      const userRole = await roleQuery.first({ useMasterKey: true });
-
-      if (userRole) {
-        // 2. 如果角色存在，则将新用户添加到该角色的用户列表中
-        const relation = userRole.getUsers();
-        relation.add(user);
-        await userRole.save(null, { useMasterKey: true });
-        console.log(`成功将用户 ${user.id} 添加到 'User' 角色。`);
-      } else {
-        console.error("严重错误：系统中未找到名为 'User' 的角色，无法为新用户分配默认角色。请在 _Role 表中创建。");
-      }
-    } catch (error) {
-      console.error(`为新用户 ${user.id} 添加到 'User' 角色时失败:`, error);
-    }
-  }
-});
-
 
 // =================================================================
 // == 安全校验核心模块
@@ -111,17 +76,16 @@ const isAdmin = async (user) => {
   return count > 0;
 };
 
-// --- 辅助函数：获取用户角色列表 (现在更可靠了) ---
+// --- 辅助函数：获取用户角色列表 ---
 const getUserRoles = async (user) => {
-    if (!user) return ['User']; 
+    if (!user) return ['User']; // 理论上不会发生，因为调用前会检查登录
     const roleQuery = new AV.Query(AV.Role);
     roleQuery.equalTo('users', user);
     const roles = await roleQuery.find({ useMasterKey: true });
     const roleNames = roles.map(role => role.get('name'));
-    // 因为 afterSave 钩子确保了新用户至少有 'User' 角色，这里的逻辑可以简化
-    // 但为了健壮性，我们仍然保留一个默认值
-    if (roleNames.length === 0) {
-        return ['User'];
+    // 如果用户没有任何角色，我们默认他是 'User'
+    if (roleNames.length === 0 || !roleNames.includes('User')) {
+        roleNames.push('User');
     }
     return roleNames;
 };
@@ -134,7 +98,6 @@ const getUserRoles = async (user) => {
 async function checkAndIncrementUsage(user, usageType) {
     const today = new Date().toISOString().slice(0, 10);
     const lastCallDate = user.get('lastCallDate');
-
     const usageCountField = `${usageType}CallCount`;
     let currentUsage = user.get(usageCountField) || 0;
     let needsSave = false;
@@ -149,7 +112,6 @@ async function checkAndIncrementUsage(user, usageType) {
     }
 
     const userRoles = await getUserRoles(user);
-    
     const permissionQuery = new AV.Query('RolePermission');
     permissionQuery.containedIn('roleName', userRoles);
     const permissions = await permissionQuery.find({ useMasterKey: true });
@@ -212,20 +174,17 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
 // == 现有业务云函数 (保持不变)
 // =================================================================
 
-// ... (您所有的其他云函数，如 updateUserProfile, followUser 等，都保持原样)
-// ... (为了简洁，这里省略了它们，请确保您的文件中保留了这些函数)
 AV.Cloud.define('hello', function(request) {
   return 'Hello world!';
 });
 
 // --- 用户与个人资料 ---
 AV.Cloud.define('updateUserProfile', async (request) => {
-  validateSessionAuth(request); // 安全校验
+  validateSessionAuth(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
   }
-  // ... (原有的 updateUserProfile 逻辑)
   const { username, bio } = request.params;
   if (username !== undefined) {
     const trimmedUsername = username.trim();
@@ -261,11 +220,10 @@ AV.Cloud.define('updateUserProfile', async (request) => {
 });
 
 AV.Cloud.define('getQiniuUserAvatarUploadToken', async (request) => {
-  validateSessionAuth(request); // 安全校验
+  validateSessionAuth(request);
   if (!request.currentUser) {
     throw new AV.Cloud.Error('用户未登录，禁止获取上传凭证。', { code: 401 });
   }
-  // ... (原有的 getQiniuUserAvatarUploadToken 逻辑)
   const userId = request.currentUser.id;
   const accessKey = process.env.QINIU_AK;
   const secretKey = process.env.QINIU_SK;
@@ -290,12 +248,11 @@ AV.Cloud.define('getQiniuUserAvatarUploadToken', async (request) => {
 });
 
 AV.Cloud.define('saveUserAvatarUrl', async (request) => {
-  validateSessionAuth(request); // 安全校验
+  validateSessionAuth(request);
   const currentUser = request.currentUser;
   if (!currentUser) {
     throw new AV.Cloud.Error('用户未登录，无法更新头像。', { code: 401 });
   }
-  // ... (原有的 saveUserAvatarUrl 逻辑)
   const { key: newKey } = request.params;
   if (!newKey) {
     throw new AV.Cloud.Error('缺少 key 参数。', { code: 400 });
@@ -349,12 +306,11 @@ AV.Cloud.define('saveUserAvatarUrl', async (request) => {
 
 // --- 关注/粉丝相关云函数 ---
 AV.Cloud.define('followUser', async (request) => {
-  validateSessionAuth(request); // 安全校验
+  validateSessionAuth(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
   }
-  // ... (原有的 followUser 逻辑)
   const { targetUserId } = request.params;
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
@@ -387,12 +343,11 @@ AV.Cloud.define('followUser', async (request) => {
 });
 
 AV.Cloud.define('unfollowUser', async (request) => {
-  validateSessionAuth(request); // 安全校验
+  validateSessionAuth(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
   }
-  // ... (原有的 unfollowUser 逻辑)
   const { targetUserId } = request.params;
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
@@ -414,8 +369,7 @@ AV.Cloud.define('unfollowUser', async (request) => {
 });
 
 AV.Cloud.define('getFollowers', async (request) => {
-  validateSessionAuth(request); // 安全校验
-  // ... (原有的 getFollowers 逻辑)
+  validateSessionAuth(request);
   const { targetUserId, page = 1, limit = 20 } = request.params;
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
@@ -433,8 +387,7 @@ AV.Cloud.define('getFollowers', async (request) => {
 });
 
 AV.Cloud.define('getFollowing', async (request) => {
-  validateSessionAuth(request); // 安全校验
-  // ... (原有的 getFollowing 逻辑)
+  validateSessionAuth(request);
   const { targetUserId, page = 1, limit = 20 } = request.params;
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
@@ -453,12 +406,11 @@ AV.Cloud.define('getFollowing', async (request) => {
 
 // --- 角色与创作管理 ---
 AV.Cloud.define('generateNewLocalCharacterId', async (request) => {
-  validateSessionAuth(request); // 安全校验
+  validateSessionAuth(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，无法生成ID。', { code: 401 });
   }
-  // ... (原有的 generateNewLocalCharacterId 逻辑)
   const updatedUser = await user.increment('localCharIdCounter', -1).save(null, {
     fetchWhenSave: true,
     useMasterKey: true
@@ -468,12 +420,11 @@ AV.Cloud.define('generateNewLocalCharacterId', async (request) => {
 });
 
 AV.Cloud.define('toggleLikeCharacter', async (request) => {
-  validateSessionAuth(request); // 安全校验
+  validateSessionAuth(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
   }
-  // ... (原有的 toggleLikeCharacter 逻辑)
   const { characterId } = request.params;
   if (typeof characterId !== 'number') {
     throw new AV.Cloud.Error('参数 characterId 必须是一个数字。', { code: 400 });
@@ -516,12 +467,11 @@ AV.Cloud.define('toggleLikeCharacter', async (request) => {
 });
 
 AV.Cloud.define('incrementChatCount', async (request) => {
-  validateSessionAuth(request); // 安全校验
+  validateSessionAuth(request);
   if (!request.currentUser) {
     console.log("未登录用户尝试增加聊天计数，已忽略。");
     return { success: true, message: "Ignored for anonymous user." };
   }
-  // ... (原有的 incrementChatCount 逻辑)
   const { characterId } = request.params;
   if (typeof characterId !== 'number') {
     throw new AV.Cloud.Error('参数 characterId 必须是一个数字。', { code: 400 });
@@ -540,14 +490,13 @@ AV.Cloud.define('incrementChatCount', async (request) => {
 });
 
 AV.Cloud.define('getQiniuUploadToken', async (request) => {
-  validateSessionAuth(request); // 安全校验
+  validateSessionAuth(request);
   const accessKey = process.env.QINIU_AK;
   const secretKey = process.env.QINIU_SK;
   const bucket = process.env.QINIU_BUCKET_NAME;
   if (!request.currentUser) {
     throw new AV.Cloud.Error('用户未登录，禁止获取上传凭证。', { code: 401 });
   }
-  // ... (原有的 getQiniuUploadToken 逻辑)
   if (!accessKey || !secretKey || !bucket) {
     console.error('七牛云环境变量未完全设置 (QINIU_AK, QINIU_SK, QINIU_BUCKET_NAME)');
     throw new AV.Cloud.Error('服务器配置错误，无法生成上传凭证。', { code: 500 });
@@ -567,12 +516,11 @@ AV.Cloud.define('getQiniuUploadToken', async (request) => {
 });
 
 AV.Cloud.define('getSubmissionStatuses', async (request) => {
-  validateSessionAuth(request); // 安全校验
+  validateSessionAuth(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
   }
-  // ... (原有的 getSubmissionStatuses 逻辑)
   const { localIds } = request.params;
   if (!Array.isArray(localIds) || localIds.length === 0) {
     return {};
@@ -592,8 +540,7 @@ AV.Cloud.define('getSubmissionStatuses', async (request) => {
 
 // --- 搜索功能 ---
 AV.Cloud.define('searchPublicContent', async (request) => {
-  validateSessionAuth(request); // 安全校验
-  // ... (原有的 searchPublicContent 逻辑)
+  validateSessionAuth(request);
   const { searchText } = request.params;
   if (!searchText || searchText.trim().length < 1) {
     return { characters: [], users: [] };
@@ -630,8 +577,7 @@ AV.Cloud.define('searchPublicContent', async (request) => {
 
 // --- 用户主页 ---
 AV.Cloud.define('getUserPublicProfile', async (request) => {
-  validateSessionAuth(request); // 安全校验
-  // ... (原有的 getUserPublicProfile 逻辑)
+  validateSessionAuth(request);
   const { userId } = request.params;
   const currentUser = request.currentUser;
   if (!userId) {
@@ -690,8 +636,7 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
 });
 
 AV.Cloud.define('getUserCreations', async (request) => {
-  validateSessionAuth(request); // 安全校验
-  // ... (原有的 getUserCreations 逻辑)
+  validateSessionAuth(request);
   const { targetUserId, page = 1, limit = 20 } = request.params;
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
@@ -710,7 +655,6 @@ AV.Cloud.define('getUserCreations', async (request) => {
 // == 管理员后台功能
 // =================================================================
 
-// ... (您原有的所有管理员函数保持不变)
 AV.Cloud.define('publishApprovedCharacters', async (request) => {
   const submissionQuery = new AV.Query('CharacterSubmissions');
   submissionQuery.equalTo('status', 'approved');
@@ -937,5 +881,38 @@ AV.Cloud.define('migrateAllCharactersToOwner', async (request) => {
   return resultMessage;
 });
 
+// =================================================================
+// == Cloud Hook - 新用户自动加入角色
+// =================================================================
+
+/**
+ * 在 _User 对象保存成功后触发
+ * 用于将新注册的用户自动添加到 'User' 角色中
+ */
+AV.Cloud.afterSave('_User', async (request) => {
+  const newUser = request.object;
+
+  if (newUser.isNew()) {
+    console.log(`afterSave hook triggered for new user, objectId: ${newUser.id}`);
+
+    const roleQuery = new AV.Query(AV.Role);
+    roleQuery.equalTo('name', 'User');
+    
+    try {
+      const userRole = await roleQuery.first({ useMasterKey: true });
+
+      if (userRole) {
+        const relation = userRole.relation('users');
+        relation.add(newUser);
+        await userRole.save(null, { useMasterKey: true });
+        console.log(`Successfully added new user ${newUser.id} to the 'User' role.`);
+      } else {
+        console.error('FATAL: The "User" role was not found. Could not assign role to new user.');
+      }
+    } catch (error) {
+      console.error(`Error adding user to role in afterSave hook: ${error}`);
+    }
+  }
+});
 
 module.exports = AV.Cloud;
