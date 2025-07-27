@@ -1,12 +1,11 @@
-// cloud.js (V3.4 - 修正了图片压缩上传策略的参数问题)
+// cloud.js (V3.5 - 最终修正版，添加 persistentNotifyUrl 解决 invalid_param 问题)
 
 'use strict';
 const AV = require('leanengine');
 const qiniu = require('qiniu');
 const crypto = require('crypto');
 
-// ... (其他所有代码保持不变，从 validateSessionAuth 到 incrementChatCount)
-
+// ... (从 validateSessionAuth 到 incrementChatCount 的所有代码保持不变)
 // =================================================================
 // == 安全校验核心模块
 // =================================================================
@@ -490,7 +489,7 @@ AV.Cloud.define('incrementChatCount', async (request) => {
   }
 });
 
-// --- vvv 核心修改：修正 getQiniuUploadToken 函数 vvv ---
+// --- vvv 核心修改：最终修正版 getQiniuUploadToken 函数 vvv ---
 AV.Cloud.define('getQiniuUploadToken', async (request) => {
   validateSessionAuth(request);
   const user = request.currentUser;
@@ -506,28 +505,23 @@ AV.Cloud.define('getQiniuUploadToken', async (request) => {
   }
   const mac = new qiniu.auth.digest.Mac(accessKey, secretKey);
 
-  // 1. 为即将上传的原图预先生成一个唯一的 key (文件名)
   const originalKey = `uploads/characters/${user.id}/${Date.now()}_original.jpg`;
-
-  // 2. 定义处理后文件的保存路径和名称
   const saveAsKey = `processed/characters/$(etag)$(ext)`; 
-  
-  // 3. 定义处理指令
   const fops = 'imageView2/2/w/600/h/900/format/jpg/q/80|imageslim';
 
   const options = {
-    // 4. 关键：scope 必须明确指定到具体的文件名
     scope: `${bucket}:${originalKey}`,
     expires: 3600,
     persistentOps: `${fops}|saveas/${qiniu.util.urlsafeBase64Encode(`${bucket}:${saveAsKey}`)}`,
     persistentPipeline: 'default-pipeline', 
+    // 关键：添加一个（可以是空的）回调URL，这是持久化处理所必需的参数
+    persistentNotifyUrl: 'http://www.example.com/qiniu/notify', 
   };
 
   const putPolicy = new qiniu.rs.PutPolicy(options);
   const uploadToken = putPolicy.uploadToken(mac);
   
   if (uploadToken) {
-    // 5. 关键：将预先生成的 key 也返回给客户端
     return { token: uploadToken, key: originalKey };
   } else {
     throw new AV.Cloud.Error('生成上传凭证失败。', { code: 500 });
@@ -558,7 +552,6 @@ AV.Cloud.define('getSubmissionStatuses', async (request) => {
   return statuses;
 });
 
-// ... (其他所有代码保持不变，从 searchPublicContent 到文件末尾)
 // --- 搜索功能 ---
 AV.Cloud.define('searchPublicContent', async (request) => {
   validateSessionAuth(request);
@@ -944,4 +937,21 @@ AV.Cloud.afterSave('_User', async (request) => {
   }
 });
 
-module.exports = AV.Cloud;
+module.exports = AV.Cloud;```
+
+**您不需要修改客户端 `upload_service.dart` 的代码**，因为它已经是正确的。
+
+### 关键改动点
+
+在 `getQiniuUploadToken` 函数中，我们只增加了一行代码：
+
+```javascript
+const options = {
+  scope: `${bucket}:${originalKey}`,
+  expires: 3600,
+  persistentOps: `${fops}|saveas/${qiniu.util.urlsafeBase64Encode(`${bucket}:${saveAsKey}`)}`,
+  persistentPipeline: 'default-pipeline', 
+  // --- vvv 核心新增 vvv ---
+  persistentNotifyUrl: 'http://www.example.com/qiniu/notify', 
+  // --- ^^^ 核心新增 ^^^ ---
+};
