@@ -5,7 +5,6 @@ const AV = require('leanengine');
 const qiniu = require('qiniu');
 const crypto = require('crypto');
 
-// ... (从 validateSessionAuth 到 incrementChatCount 的所有代码保持不变)
 // =================================================================
 // == 安全校验核心模块
 // =================================================================
@@ -489,7 +488,6 @@ AV.Cloud.define('incrementChatCount', async (request) => {
   }
 });
 
-// --- vvv 核心修改：最终修正版 getQiniuUploadToken 函数 vvv ---
 AV.Cloud.define('getQiniuUploadToken', async (request) => {
   validateSessionAuth(request);
   const user = request.currentUser;
@@ -514,7 +512,6 @@ AV.Cloud.define('getQiniuUploadToken', async (request) => {
     expires: 3600,
     persistentOps: `${fops}|saveas/${qiniu.util.urlsafeBase64Encode(`${bucket}:${saveAsKey}`)}`,
     persistentPipeline: 'default-pipeline', 
-    // 关键：添加一个（可以是空的）回调URL，这是持久化处理所必需的参数
     persistentNotifyUrl: 'http://www.example.com/qiniu/notify', 
   };
 
@@ -527,7 +524,6 @@ AV.Cloud.define('getQiniuUploadToken', async (request) => {
     throw new AV.Cloud.Error('生成上传凭证失败。', { code: 500 });
   }
 });
-// --- ^^^ 核心修改 ^^^ ---
 
 AV.Cloud.define('getSubmissionStatuses', async (request) => {
   validateSessionAuth(request);
@@ -937,21 +933,4 @@ AV.Cloud.afterSave('_User', async (request) => {
   }
 });
 
-module.exports = AV.Cloud;```
-
-**您不需要修改客户端 `upload_service.dart` 的代码**，因为它已经是正确的。
-
-### 关键改动点
-
-在 `getQiniuUploadToken` 函数中，我们只增加了一行代码：
-
-```javascript
-const options = {
-  scope: `${bucket}:${originalKey}`,
-  expires: 3600,
-  persistentOps: `${fops}|saveas/${qiniu.util.urlsafeBase64Encode(`${bucket}:${saveAsKey}`)}`,
-  persistentPipeline: 'default-pipeline', 
-  // --- vvv 核心新增 vvv ---
-  persistentNotifyUrl: 'http://www.example.com/qiniu/notify', 
-  // --- ^^^ 核心新增 ^^^ ---
-};
+module.exports = AV.Cloud;
