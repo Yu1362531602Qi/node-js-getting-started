@@ -1,4 +1,4 @@
-// cloud.js (V3.2 - Plan B 完整版, 使用 UserFollow 替代 Follow)
+// cloud.js (V3.3 - 增加了角色卡图片上传时的自动压缩优化)
 
 'use strict';
 const AV = require('leanengine');
@@ -317,7 +317,7 @@ AV.Cloud.define('followUser', async (request) => {
   if (user.id === targetUserId) {
     throw new AV.Cloud.Error('不能关注自己。', { code: 400 });
   }
-  const followQuery = new AV.Query('UserFollow'); // 核心修改
+  const followQuery = new AV.Query('UserFollow');
   followQuery.equalTo('user', user);
   followQuery.equalTo('followed', AV.Object.createWithoutData('_User', targetUserId));
   const existingFollow = await followQuery.first();
@@ -325,7 +325,7 @@ AV.Cloud.define('followUser', async (request) => {
     console.log(`用户 ${user.id} 已关注 ${targetUserId}，无需重复操作。`);
     return { success: true, message: '已关注' };
   }
-  const Follow = AV.Object.extend('UserFollow'); // 核心修改
+  const Follow = AV.Object.extend('UserFollow');
   const newFollow = new Follow();
   newFollow.set('user', user);
   newFollow.set('followed', AV.Object.createWithoutData('_User', targetUserId));
@@ -351,7 +351,7 @@ AV.Cloud.define('unfollowUser', async (request) => {
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
   }
-  const followQuery = new AV.Query('UserFollow'); // 核心修改
+  const followQuery = new AV.Query('UserFollow');
   followQuery.equalTo('user', user);
   followQuery.equalTo('followed', AV.Object.createWithoutData('_User', targetUserId));
   const followRecord = await followQuery.first();
@@ -374,7 +374,7 @@ AV.Cloud.define('getFollowers', async (request) => {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
   }
   const targetUser = AV.Object.createWithoutData('_User', targetUserId);
-  const query = new AV.Query('UserFollow'); // 核心修改
+  const query = new AV.Query('UserFollow');
   query.equalTo('followed', targetUser);
   query.include('user');
   query.select('user.username', 'user.avatarUrl', 'user.objectId');
@@ -392,7 +392,7 @@ AV.Cloud.define('getFollowing', async (request) => {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
   }
   const targetUser = AV.Object.createWithoutData('_User', targetUserId);
-  const query = new AV.Query('UserFollow'); // 核心修改
+  const query = new AV.Query('UserFollow');
   query.equalTo('user', targetUser);
   query.include('followed');
   query.select('followed.username', 'followed.avatarUrl', 'followed.objectId');
@@ -501,12 +501,32 @@ AV.Cloud.define('getQiniuUploadToken', async (request) => {
     throw new AV.Cloud.Error('服务器配置错误，无法生成上传凭证。', { code: 500 });
   }
   const mac = new qiniu.auth.digest.Mac(accessKey, secretKey);
+
+  // --- vvv 核心修改：添加图片压缩与持久化处理指令 vvv ---
+  // 定义处理后文件的保存路径和名称, $(etag) 是文件的哈希值，保证唯一性
+  const saveAsKey = 'processed/characters/$(etag)$(ext)'; 
+  
+  // 定义处理指令：
+  // 1. imageView2: 缩放图片，模式2为等比缩放
+  // 2. w/600/h/900: 最大宽度600，最大高度900
+  // 3. format/jpg: 统一转换为jpg格式
+  // 4. q/80: jpg质量设置为80（高质量和文件大小的良好平衡点）
+  // 5. imageslim: 七牛云的智能压缩，进一步优化体积
+  const fops = 'imageView2/2/w/600/h/900/format/jpg/q/80|imageslim';
+
   const options = {
     scope: bucket,
     expires: 3600,
+    // 关键：设置持久化处理指令
+    persistentOps: `${fops}|saveas/${qiniu.util.urlsafeBase64Encode(`${bucket}:${saveAsKey}`)}`,
+    // 关键：指定处理队列，'default-pipeline'是默认值
+    persistentPipeline: 'default-pipeline', 
   };
+  // --- ^^^ 核心修改 ^^^ ---
+
   const putPolicy = new qiniu.rs.PutPolicy(options);
   const uploadToken = putPolicy.uploadToken(mac);
+  
   if (uploadToken) {
     return { token: uploadToken };
   } else {
@@ -619,7 +639,7 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
   };
   let isFollowing = false;
   if (currentUser && currentUser.id !== userId) {
-    const followQuery = new AV.Query('UserFollow'); // 核心修改
+    const followQuery = new AV.Query('UserFollow');
     followQuery.equalTo('user', currentUser);
     followQuery.equalTo('followed', user);
     const followRecord = await followQuery.first();
