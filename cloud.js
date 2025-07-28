@@ -1,10 +1,16 @@
-// cloud.js (V4.3 - Final Stream Function Fix)
+// cloud.js (V4.4 - Logic Extraction for Express Route)
 
 'use strict';
 const AV = require('leanengine');
 const qiniu = require('qiniu');
 const crypto = require('crypto');
 const fetch = require('node-fetch');
+
+// =================================================================
+// == 模块导出 (新增)
+// =================================================================
+// 我们将需要被 Express 路由使用的函数导出
+module.exports.streamProxyApiCallHandler = streamProxyApiCallHandler;
 
 // =================================================================
 // == 安全与配置模块
@@ -23,7 +29,6 @@ const API_ENDPOINTS = {
   minimax_tts: `https://api.minimaxi.com/v1/t2a_v2?GroupId=${MINIMAX_GROUP_ID}`,
 };
 
-// ... (handshake, isAdmin, etc. remain the same)
 const validateSessionAuth = (request) => {
   const sessionAuthToken = request.expressReq.get('X-Session-Auth-Token');
   if (!sessionAuthToken) {
@@ -31,6 +36,7 @@ const validateSessionAuth = (request) => {
   }
 };
 
+// ... (handshake, isAdmin, etc. remain the same)
 AV.Cloud.define('handshake', async (request) => {
   const { version, timestamp, signature } = request.params;
   if (!version || !timestamp || !signature) {
@@ -47,7 +53,7 @@ AV.Cloud.define('handshake', async (request) => {
       throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
   }
   const challengeData = `${version}|${timestamp}`;
-  const hmac = crypto.createHmac('sha256', rootKey);
+  const hmac = crypto.createHmac('sha265', rootKey);
   hmac.update(challengeData);
   const serverSignature = hmac.digest('hex');
   if (serverSignature !== signature) {
@@ -142,101 +148,95 @@ async function checkApiPermission(user, usageType) {
     return { canCall: true, message: '许可已授予。', historyLimit: historyLimit };
 }
 
-// --- vvv 核心修正：使用 Promise.then().catch() 链式调用来重写流函数 vvv ---
-AV.Cloud.define('streamProxyApiCall', (request, response) => {
+// --- vvv 核心修改：将流式处理逻辑封装成一个独立的 async 函数 vvv ---
+// 这个函数现在是一个标准的 Express 中间件/处理器
+async function streamProxyApiCallHandler(req, res) {
     try {
-        validateSessionAuth(request);
-        const user = request.currentUser;
-        if (!user) {
-            return response.status(401).send({ error: '用户未登录，禁止操作。' });
+        // 注意：这里的 req 和 res 是原始的 Express 对象
+        validateSessionAuth({ expressReq: req }); // 手动调用我们的校验
+        
+        // 从请求头中获取 session token 来获取当前用户
+        const sessionToken = req.headers['x-lc-session'];
+        if (!sessionToken) {
+            return res.status(401).send({ error: '用户未登录，禁止操作。' });
+        }
+        const user = await AV.User.become(sessionToken);
+
+        const { apiService, modelName, messages, temperature } = req.body;
+
+        const permission = await checkApiPermission(user, 'llm');
+        
+        const endpoint = API_ENDPOINTS[apiService];
+        let apiKey;
+        switch(apiService) {
+            case 'deepseek': apiKey = DEEPSEEK_API_KEY; break;
+            case 'siliconflow': apiKey = SILICONFLOW_API_KEY; break;
+            case 'gemini': apiKey = GEMINI_API_KEY; break;
+            default:
+                throw new AV.Cloud.Error('不支持的 apiService 类型。', { code: 400 });
         }
 
-        const { apiService, modelName, messages, temperature } = request.params;
+        if (!endpoint || !apiKey) {
+            console.error(`服务器配置错误: apiService "${apiService}" 缺少 endpoint 或 apiKey。`);
+            throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
+        }
 
-        // 使用 Promise 链来处理异步操作
-        checkApiPermission(user, 'llm')
-            .then(permission => {
-                const endpoint = API_ENDPOINTS[apiService];
-                let apiKey;
-                switch(apiService) {
-                    case 'deepseek': apiKey = DEEPSEEK_API_KEY; break;
-                    case 'siliconflow': apiKey = SILICONFLOW_API_KEY; break;
-                    case 'gemini': apiKey = GEMINI_API_KEY; break;
-                    default:
-                        throw new AV.Cloud.Error('不支持的 apiService 类型。', { code: 400 });
-                }
+        const truncatedMessages = messages.length > permission.historyLimit && permission.historyLimit !== -1
+            ? [messages[0], ...messages.slice(-(permission.historyLimit * 2))]
+            : messages;
 
-                if (!endpoint || !apiKey) {
-                    console.error(`服务器配置错误: apiService "${apiService}" 缺少 endpoint 或 apiKey。`);
-                    throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
-                }
+        const body = JSON.stringify({
+            model: modelName,
+            messages: truncatedMessages,
+            temperature: temperature || 1.0,
+            stream: true,
+        });
 
-                const truncatedMessages = messages.length > permission.historyLimit && permission.historyLimit !== -1
-                    ? [messages[0], ...messages.slice(-(permission.historyLimit * 2))]
-                    : messages;
+        const apiResponse = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`,
+            },
+            body: body,
+        });
 
-                const body = JSON.stringify({
-                    model: modelName,
-                    messages: truncatedMessages,
-                    temperature: temperature || 1.0,
-                    stream: true,
-                });
+        if (!apiResponse.ok) {
+            const errorText = await apiResponse.text();
+            console.error(`请求第三方API失败 (${apiResponse.status}): ${errorText}`);
+            throw new AV.Cloud.Error(`AI服务商返回错误: ${apiResponse.statusText}`, { code: 502 });
+        }
 
-                return fetch(endpoint, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${apiKey}`,
-                    },
-                    body: body,
-                });
-            })
-            .then(apiResponse => {
-                if (!apiResponse.ok) {
-                    // 如果 fetch 响应不 ok，读取错误体并抛出
-                    return apiResponse.text().then(errorText => {
-                        console.error(`请求第三方API失败 (${apiResponse.status}): ${errorText}`);
-                        throw new AV.Cloud.Error(`AI服务商返回错误: ${apiResponse.statusText}`, { code: 502 });
-                    });
-                }
+        res.setHeader('Content-Type', 'application/octet-stream');
+        apiResponse.body.pipe(res);
 
-                response.setHeader('Content-Type', 'application/octet-stream');
-                apiResponse.body.pipe(response);
+        apiResponse.body.on('end', () => {
+            user.save(null, { useMasterKey: true })
+                .then(() => console.log(`用户 ${user.id} 的 llmCallCount 计数更新成功。`))
+                .catch(saveError => console.error(`为用户 ${user.id} 更新用量计数失败:`, saveError));
+        });
 
-                apiResponse.body.on('end', () => {
-                    user.save(null, { useMasterKey: true })
-                        .then(() => console.log(`用户 ${user.id} 的 llmCallCount 计数更新成功。`))
-                        .catch(saveError => console.error(`为用户 ${user.id} 更新用量计数失败:`, saveError));
-                });
-
-                apiResponse.body.on('error', (err) => {
-                    console.error('代理流传输过程中发生错误:', err);
-                    if (!response.headersSent) {
-                        response.status(500).send({ error: '流传输错误' });
-                    }
-                });
-            })
-            .catch(error => {
-                // 统一捕获链中所有的错误
-                console.error(`streamProxyApiCall 内部错误: ${error.message}`);
-                if (!response.headersSent) {
-                    const errorCode = error.code || 500;
-                    response.status(errorCode).send(JSON.stringify({ code: errorCode, error: error.message }));
-                }
-            });
+        apiResponse.body.on('error', (err) => {
+            console.error('代理流传输过程中发生错误:', err);
+            if (!res.headersSent) {
+                res.status(500).send({ error: '流传输错误' });
+            }
+        });
 
     } catch (error) {
-        // 捕获同步错误，例如 validateSessionAuth 抛出的错误
-        console.error(`streamProxyApiCall 同步错误: ${error.message}`);
-        if (!response.headersSent) {
+        console.error(`streamProxyApiCallHandler 错误: ${error.message}`);
+        if (!res.headersSent) {
             const errorCode = error.code || 500;
-            response.status(errorCode).send(JSON.stringify({ code: errorCode, error: error.message }));
+            res.status(errorCode).send(JSON.stringify({ code: errorCode, error: error.message }));
         }
     }
-}, {
-    stream: true 
-});
-// --- ^^^ 核心修正 ^^^ ---
+}
+// --- ^^^ 核心修改 ^^^ ---
+
+// --- vvv 核心修改：删除旧的 AV.Cloud.define('streamProxyApiCall', ...) vvv ---
+// (此区域留空，确保旧的定义已被删除)
+// --- ^^^ 核心修改 ^^^ ---
+
 
 AV.Cloud.define('proxyTtsApiCall', async (request) => {
     // ... (此函数保持不变)
@@ -1044,4 +1044,4 @@ AV.Cloud.afterSave('_User', async (request) => {
   }
 });
 
-module.exports = AV.Cloud;
+// module.exports = AV.Cloud; // <-- 注意：当使用 server.js 时，这一行通常不需要
