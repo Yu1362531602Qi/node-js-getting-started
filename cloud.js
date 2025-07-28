@@ -1,4 +1,4 @@
-// cloud.js (V3.3 - 增加历史对话轮数限制)
+// cloud.js (V3.4 - 智能区分赞助者和普通用户的超额提示)
 
 'use strict';
 const AV = require('leanengine');
@@ -94,7 +94,9 @@ const getUserRoles = async (user) => {
 // == API 调用限制模块
 // =================================================================
 
-async function checkAndIncrementUsage(user, usageType, permissions) {
+// --- vvv 核心修改：函数签名增加了 userRoles 参数 vvv ---
+async function checkAndIncrementUsage(user, usageType, permissions, userRoles) {
+// --- ^^^ 核心修改 ^^^ ---
     const today = new Date().toISOString().slice(0, 10);
     const lastCallDate = user.get('lastCallDate');
     const usageCountField = `${usageType}CallCount`;
@@ -112,12 +114,26 @@ async function checkAndIncrementUsage(user, usageType, permissions) {
 
     const limitField = `${usageType}Limit`;
     const dailyLimit = Math.max(...permissions.map(p => p.get(limitField) || 0));
-    const userRoles = permissions.map(p => p.get('roleName'));
-
+    
+    // --- vvv 核心修改：移除这里的 userRoles 计算，因为它已经从外部传入 vvv ---
+    // const userRolesForLog = permissions.map(p => p.get('roleName'));
+    // console.log(`用户 ${user.id} (角色: ${userRolesForLog.join(', ')}) 的 ${usageType} 限额为 ${dailyLimit}，当前已用 ${currentUsage}`);
     console.log(`用户 ${user.id} (角色: ${userRoles.join(', ')}) 的 ${usageType} 限额为 ${dailyLimit}，当前已用 ${currentUsage}`);
+    // --- ^^^ 核心修改 ^^^ ---
 
     if (currentUsage >= dailyLimit) {
-        throw new AV.Cloud.Error(`您今日的${usageType === 'llm' ? '语言模型' : '语音'}调用次数已达上限 (${dailyLimit}次)。`, { code: 429 });
+        // --- vvv 核心修改：根据用户角色返回不同的提示信息 vvv ---
+        const isSponsor = userRoles.includes('赞助者');
+        const modelType = usageType === 'llm' ? '语言模型' : '语音';
+
+        if (isSponsor) {
+            // 对赞助者显示标准提示
+            throw new AV.Cloud.Error(`您今日的${modelType}调用次数已达上限 (${dailyLimit}次)。`, { code: 429 });
+        } else {
+            // 对普通用户显示引导提示
+            throw new AV.Cloud.Error(`今日免费次数已用尽。赞助可提升每日额度，或在“设置”中配置您自己的API密钥以享受无限次对话。`, { code: 429 });
+        }
+        // --- ^^^ 核心修改 ^^^ ---
     }
 
     user.increment(usageCountField, 1);
@@ -134,7 +150,6 @@ async function checkAndIncrementUsage(user, usageType, permissions) {
     }
 }
 
-// --- vvv 核心修改：requestApiCallPermission 函数 vvv ---
 AV.Cloud.define('requestApiCallPermission', async (request) => {
     validateSessionAuth(request);
     const user = request.currentUser;
@@ -142,13 +157,12 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
     }
 
-    // 1. 管理员直接拥有无限权限
     if (await isAdmin(user)) {
         console.log(`管理员 ${user.get('username')} 请求调用许可，直接通过。`);
         return { 
             canCall: true, 
             message: '管理员权限，许可已授予。',
-            historyLimit: -1 // -1 代表无限制
+            historyLimit: -1
         };
     }
 
@@ -157,7 +171,6 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         throw new AV.Cloud.Error('无效的 usageType 参数，必须是 "llm" 或 "tts"。', { code: 400 });
     }
 
-    // 2. 获取用户角色和对应的权限配置
     const userRoles = await getUserRoles(user);
     const permissionQuery = new AV.Query('RolePermission');
     permissionQuery.containedIn('roleName', userRoles);
@@ -168,14 +181,12 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         throw new AV.Cloud.Error('服务器权限配置错误，请联系管理员。', { code: 500 });
     }
 
-    // 3. 计算历史对话轮数限制 (取用户所有角色中最高的那个值)
-    // 如果 historyLimit 字段不存在，则默认为 15
     const historyLimit = Math.max(...permissions.map(p => p.get('historyLimit') ?? 15));
 
-    // 4. 检查并增加每日调用次数
     try {
-        await checkAndIncrementUsage(user, usageType, permissions);
-        // 5. 如果检查通过，返回成功以及计算出的历史轮数限制
+        // --- vvv 核心修改：将 userRoles 传递给检查函数 vvv ---
+        await checkAndIncrementUsage(user, usageType, permissions, userRoles);
+        // --- ^^^ 核心修改 ^^^ ---
         return { 
             canCall: true, 
             message: '许可已授予。',
@@ -183,15 +194,13 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         };
     } catch (error) {
         console.log(`用户 ${user.id} 的 ${usageType} 调用被拒绝: ${error.message}`);
-        // 6. 如果检查不通过，返回失败
         return { 
             canCall: false, 
             message: error.message,
-            historyLimit: 0 // 调用被拒绝时，轮数限制为0
+            historyLimit: 0
         };
     }
 });
-// --- ^^^ 核心修改 ^^^ ---
 
 
 // =================================================================
