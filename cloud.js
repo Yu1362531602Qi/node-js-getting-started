@@ -1,23 +1,29 @@
-// lib/cloud.js (V3.4 - 引入安全API代理)
-
 'use strict';
 const AV = require('leanengine');
 const qiniu = require('qiniu');
 const crypto = require('crypto');
-const https = require('https'); // 引入 Node.js 的 https 模块用于流式请求
+const https = require('https');
 
 // =================================================================
 // == 安全校验核心模块
 // =================================================================
 
+// --- vvv 核心修正 vvv ---
 const validateSessionAuth = (request) => {
-  const sessionAuthToken = request.expressReq.get('X-Session-Auth-Token');
+  // 核心修正：从 request.meta.headers 获取头信息，兼容所有类型的云函数
+  // LeanCloud 会将所有 HTTP Header 的 key 转换为小写
+  const sessionAuthToken = request.meta.headers['x-session-auth-token'];
+  
   if (!sessionAuthToken) {
+    // 增加日志，帮助调试
+    console.error('安全校验失败：请求头中缺少 X-Session-Auth-Token。', { headers: request.meta.headers });
     throw new AV.Cloud.Error('无效的客户端，禁止操作。', { code: 403 });
   }
+  
   const functionName = request.functionName || 'unknown';
   console.log(`Session Auth Token 校验通过，函数: ${functionName}`);
 };
+// --- ^^^ 核心修正 ^^^ ---
 
 AV.Cloud.define('handshake', async (request) => {
   const { version, timestamp, signature } = request.params;
@@ -185,30 +191,23 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
     }
 });
 
-// --- vvv 核心新增：API 代理云函数 vvv ---
 AV.Cloud.define('proxyLlmStream', async (request) => {
-    // 1. 安全校验
     validateSessionAuth(request);
     const user = request.currentUser;
     if (!user) {
         throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
     }
 
-    // 2. 权限和次数检查 (复用现有逻辑)
-    // 注意：这里我们硬编码 'llm'，因为此函数专用于语言模型代理
     const permissionResult = await AV.Cloud.run('requestApiCallPermission', { usageType: 'llm' }, { user });
     if (!permissionResult.canCall) {
-        // 如果没权限，直接抛出从 requestApiCallPermission 返回的错误信息
         throw new AV.Cloud.Error(permissionResult.message, { code: 429 });
     }
     
-    // 3. 获取前端传递的参数
     const { serviceProvider, requestBody } = request.params;
     if (!serviceProvider || !requestBody) {
         throw new AV.Cloud.Error('缺少 serviceProvider 或 requestBody 参数。', { code: 400 });
     }
 
-    // 4. 根据服务商选择 API Key 和 URL
     let targetUrl, apiKey, hostname, path;
     const headers = { 'Content-Type': 'application/json' };
 
@@ -237,12 +236,10 @@ AV.Cloud.define('proxyLlmStream', async (request) => {
         throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
     }
 
-    // 5. 解析目标 URL 以便使用 https 模块
     const url = new URL(targetUrl);
     hostname = url.hostname;
     path = url.pathname;
 
-    // 6. 发起流式请求并代理回客户端
     const options = {
         hostname: hostname,
         path: path,
@@ -251,12 +248,10 @@ AV.Cloud.define('proxyLlmStream', async (request) => {
     };
 
     const proxyReq = https.request(options, (proxyRes) => {
-        // 将目标服务器的响应头和状态码原样返回给客户端
         request.response.status(proxyRes.statusCode);
         for (const key in proxyRes.headers) {
             request.response.set(key, proxyRes.headers[key]);
         }
-        // 将目标服务器的响应体数据流直接 pipe 到客户端的响应流中
         proxyRes.pipe(request.response);
     });
 
@@ -265,11 +260,9 @@ AV.Cloud.define('proxyLlmStream', async (request) => {
         request.response.status(500).send(`代理请求失败: ${e.message}`);
     });
 
-    // 写入从前端收到的请求体
     proxyReq.write(JSON.stringify(requestBody));
     proxyReq.end();
 });
-// --- ^^^ 核心新增 ^^^ ---
 
 
 // =================================================================
