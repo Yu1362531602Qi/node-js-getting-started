@@ -1,30 +1,23 @@
-'use strict'
+'use strict';
+const AV = require('leanengine');
+const app = require('./app'); // 引入 Express app 实例
 
-const AV = require('leanengine')
+// 引入我们 cloud.js 中导出的处理器
+const { streamProxyApiCallHandler } = require('./cloud');
 
-AV.init({
-  appId: process.env.LEANCLOUD_APP_ID,
-  appKey: process.env.LEANCLOUD_APP_KEY,
-  masterKey: process.env.LEANCLOUD_APP_MASTER_KEY
-})
+// 定义端口
+const PORT = parseInt(process.env.LEANCLOUD_APP_PORT || process.env.PORT || 3000);
 
-// Comment the following line if you do not want to use masterKey.
-AV.Cloud.useMasterKey()
+// 注册自定义的 Express 路由
+// 这个路由会匹配 /1.1/functions/streamProxyApiCall
+// LeanEngine SDK 会自动为云函数创建 /1.1/functions/ 前缀
+// 但为了保险起见，我们手动定义完整的路径
+app.post('/1.1/functions/streamProxyApiCall', streamProxyApiCallHandler);
 
-const app = require('./app')
-
-// Retrieves the port number from environment variable `LEANCLOUD_APP_PORT`.
-// LeanEngine runtime will assign a port and set the environment variable automatically.
-const PORT = parseInt(process.env.LEANCLOUD_APP_PORT || process.env.PORT || 3000)
-
-app.listen(PORT, (err) => {
-  console.log('Node app is running on port:', PORT)
-
-  // Registers a global exception handler for uncaught exceptions.
-  process.on('uncaughtException', err => {
-    console.error('Caught exception:', err.stack)
-  });
-  process.on('unhandledRejection', (reason, p) => {
-    console.error('Unhandled Rejection at: Promise ', p, ' reason: ', reason.stack)
-  })
-})
+// 启动服务器
+app.listen(PORT, function (err) {
+  if (err) {
+    return console.error(err);
+  }
+  console.log('Node app is running on port:', PORT);
+});
