@@ -1,4 +1,4 @@
-// cloud.js (V3.6 - 全功能头衔系统)
+// cloud.js (V3.3 - 增加历史对话轮数限制)
 
 'use strict';
 const AV = require('leanengine');
@@ -8,6 +8,38 @@ const crypto = require('crypto');
 // =================================================================
 // == 安全校验核心模块
 // =================================================================
+
+// --- vvv 核心新增：头衔系统核心辅助函数 vvv ---
+const getHighestPriorityTitle = async (user) => {
+    if (!user) return null;
+
+    const userRoles = await getUserRoles(user);
+    
+    // 定义角色的优先级，越靠前优先级越高
+    const rolePriority = ['Admin', '赞助者', 'User'];
+
+    const permissionQuery = new AV.Query('RolePermission');
+    permissionQuery.containedIn('roleName', userRoles);
+    permissionQuery.select(['roleName', 'title']);
+    const permissions = await permissionQuery.find({ useMasterKey: true });
+
+    if (permissions.length === 0) return null;
+
+    // 将权限转换为 Map 方便查找
+    const permissionMap = new Map(permissions.map(p => [p.get('roleName'), p.get('title')]));
+
+    // 按照优先级顺序查找第一个有效的头衔
+    for (const roleName of rolePriority) {
+        if (userRoles.includes(roleName)) {
+            const title = permissionMap.get(roleName);
+            if (title && title.trim().length > 0) {
+                return title; // 找到了，立即返回
+            }
+        }
+    }
+
+    return null; // 没有找到任何有效头衔
+};
 
 const validateSessionAuth = (request) => {
   const sessionAuthToken = request.expressReq.get('X-Session-Auth-Token');
@@ -89,50 +121,12 @@ const getUserRoles = async (user) => {
     return roleNames;
 };
 
-// --- vvv 核心新增：头衔系统核心辅助函数 vvv ---
-/**
- * 根据用户的角色，获取其最高优先级的头衔。
- * @param {AV.User} user - LeanCloud 用户对象。
- * @returns {Promise<string|null>} - 返回头衔字符串，如果没有则返回 null。
- */
-const getHighestPriorityTitle = async (user) => {
-    if (!user) return null;
-
-    const userRoles = await getUserRoles(user);
-    
-    // 定义角色的优先级，越靠前优先级越高
-    const rolePriority = ['Admin', '赞助者', 'User'];
-
-    const permissionQuery = new AV.Query('RolePermission');
-    permissionQuery.containedIn('roleName', userRoles);
-    permissionQuery.select(['roleName', 'title']);
-    const permissions = await permissionQuery.find({ useMasterKey: true });
-
-    if (permissions.length === 0) return null;
-
-    // 将权限转换为 Map 方便查找
-    const permissionMap = new Map(permissions.map(p => [p.get('roleName'), p.get('title')]));
-
-    // 按照优先级顺序查找第一个有效的头衔
-    for (const roleName of rolePriority) {
-        if (userRoles.includes(roleName)) {
-            const title = permissionMap.get(roleName);
-            if (title && title.trim().length > 0) {
-                return title; // 找到了，立即返回
-            }
-        }
-    }
-
-    return null; // 没有找到任何有效头衔
-};
-// --- ^^^ 核心新增 ^^^ ---
-
 
 // =================================================================
 // == API 调用限制模块
 // =================================================================
 
-async function checkAndIncrementUsage(user, usageType, permissions, userRoles) {
+async function checkAndIncrementUsage(user, usageType, permissions) {
     const today = new Date().toISOString().slice(0, 10);
     const lastCallDate = user.get('lastCallDate');
     const usageCountField = `${usageType}CallCount`;
@@ -150,18 +144,12 @@ async function checkAndIncrementUsage(user, usageType, permissions, userRoles) {
 
     const limitField = `${usageType}Limit`;
     const dailyLimit = Math.max(...permissions.map(p => p.get(limitField) || 0));
+    const userRoles = permissions.map(p => p.get('roleName'));
 
     console.log(`用户 ${user.id} (角色: ${userRoles.join(', ')}) 的 ${usageType} 限额为 ${dailyLimit}，当前已用 ${currentUsage}`);
 
     if (currentUsage >= dailyLimit) {
-        const isSponsor = userRoles.includes('赞助者');
-        const modelType = usageType === 'llm' ? '语言模型' : '语音';
-
-        if (isSponsor) {
-            throw new AV.Cloud.Error(`您今日的${modelType}调用次数已达上限 (${dailyLimit}次)。`, { code: 429 });
-        } else {
-            throw new AV.Cloud.Error(`今日免费次数已用尽。赞助可提升每日额度，或在“设置”中配置您自己的API密钥以享受无限次对话。`, { code: 429 });
-        }
+        throw new AV.Cloud.Error(`您今日的${usageType === 'llm' ? '语言模型' : '语音'}调用次数已达上限 (${dailyLimit}次)。`, { code: 429 });
     }
 
     user.increment(usageCountField, 1);
@@ -178,6 +166,7 @@ async function checkAndIncrementUsage(user, usageType, permissions, userRoles) {
     }
 }
 
+// --- vvv 核心修改：requestApiCallPermission 函数 vvv ---
 AV.Cloud.define('requestApiCallPermission', async (request) => {
     validateSessionAuth(request);
     const user = request.currentUser;
@@ -185,12 +174,13 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
     }
 
+    // 1. 管理员直接拥有无限权限
     if (await isAdmin(user)) {
         console.log(`管理员 ${user.get('username')} 请求调用许可，直接通过。`);
         return { 
             canCall: true, 
             message: '管理员权限，许可已授予。',
-            historyLimit: -1
+            historyLimit: -1 // -1 代表无限制
         };
     }
 
@@ -199,6 +189,7 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         throw new AV.Cloud.Error('无效的 usageType 参数，必须是 "llm" 或 "tts"。', { code: 400 });
     }
 
+    // 2. 获取用户角色和对应的权限配置
     const userRoles = await getUserRoles(user);
     const permissionQuery = new AV.Query('RolePermission');
     permissionQuery.containedIn('roleName', userRoles);
@@ -209,10 +200,14 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         throw new AV.Cloud.Error('服务器权限配置错误，请联系管理员。', { code: 500 });
     }
 
+    // 3. 计算历史对话轮数限制 (取用户所有角色中最高的那个值)
+    // 如果 historyLimit 字段不存在，则默认为 15
     const historyLimit = Math.max(...permissions.map(p => p.get('historyLimit') ?? 15));
 
+    // 4. 检查并增加每日调用次数
     try {
-        await checkAndIncrementUsage(user, usageType, permissions, userRoles);
+        await checkAndIncrementUsage(user, usageType, permissions);
+        // 5. 如果检查通过，返回成功以及计算出的历史轮数限制
         return { 
             canCall: true, 
             message: '许可已授予。',
@@ -220,17 +215,19 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         };
     } catch (error) {
         console.log(`用户 ${user.id} 的 ${usageType} 调用被拒绝: ${error.message}`);
+        // 6. 如果检查不通过，返回失败
         return { 
             canCall: false, 
             message: error.message,
-            historyLimit: 0
+            historyLimit: 0 // 调用被拒绝时，轮数限制为0
         };
     }
 });
+// --- ^^^ 核心修改 ^^^ ---
 
 
 // =================================================================
-// == 业务云函数
+// == 现有业务云函数 (无需修改，保持原样)
 // =================================================================
 
 AV.Cloud.define('hello', function(request) {
@@ -377,7 +374,7 @@ AV.Cloud.define('followUser', async (request) => {
   if (user.id === targetUserId) {
     throw new AV.Cloud.Error('不能关注自己。', { code: 400 });
   }
-  const followQuery = new AV.Query('UserFollow');
+  const followQuery = new AV.Query('UserFollow'); // 核心修改
   followQuery.equalTo('user', user);
   followQuery.equalTo('followed', AV.Object.createWithoutData('_User', targetUserId));
   const existingFollow = await followQuery.first();
@@ -385,7 +382,7 @@ AV.Cloud.define('followUser', async (request) => {
     console.log(`用户 ${user.id} 已关注 ${targetUserId}，无需重复操作。`);
     return { success: true, message: '已关注' };
   }
-  const Follow = AV.Object.extend('UserFollow');
+  const Follow = AV.Object.extend('UserFollow'); // 核心修改
   const newFollow = new Follow();
   newFollow.set('user', user);
   newFollow.set('followed', AV.Object.createWithoutData('_User', targetUserId));
@@ -411,7 +408,7 @@ AV.Cloud.define('unfollowUser', async (request) => {
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
   }
-  const followQuery = new AV.Query('UserFollow');
+  const followQuery = new AV.Query('UserFollow'); // 核心修改
   followQuery.equalTo('user', user);
   followQuery.equalTo('followed', AV.Object.createWithoutData('_User', targetUserId));
   const followRecord = await followQuery.first();
@@ -434,7 +431,7 @@ AV.Cloud.define('getFollowers', async (request) => {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
   }
   const targetUser = AV.Object.createWithoutData('_User', targetUserId);
-  const query = new AV.Query('UserFollow');
+  const query = new AV.Query('UserFollow'); // 核心修改
   query.equalTo('followed', targetUser);
   query.include('user');
   query.select('user.username', 'user.avatarUrl', 'user.objectId');
@@ -452,7 +449,7 @@ AV.Cloud.define('getFollowing', async (request) => {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
   }
   const targetUser = AV.Object.createWithoutData('_User', targetUserId);
-  const query = new AV.Query('UserFollow');
+  const query = new AV.Query('UserFollow'); // 核心修改
   query.equalTo('user', targetUser);
   query.include('followed');
   query.select('followed.username', 'followed.avatarUrl', 'followed.objectId');
@@ -624,17 +621,9 @@ AV.Cloud.define('searchPublicContent', async (request) => {
       characterQuery.find(),
       userQuery.find()
     ]);
-
-    // 为搜索到的用户并行查询并附加头衔
-    const usersWithTitles = await Promise.all(userResults.map(async (user) => {
-        const userJSON = user.toJSON();
-        userJSON.equippedTitle = await getHighestPriorityTitle(user);
-        return userJSON;
-    }));
-
     return {
       characters: characterResults,
-      users: usersWithTitles,
+      users: userResults,
     };
   } catch (error) {
     console.error('搜索时发生错误:', error);
@@ -656,14 +645,6 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
   if (!user) {
     throw new AV.Cloud.Error('用户不存在。', { code: 404 });
   }
-
-  // 获取用户数据后，调用新函数计算头衔
-  const equippedTitle = await getHighestPriorityTitle(user);
-  const userJSON = user.toJSON();
-  if (equippedTitle) {
-      userJSON.equippedTitle = equippedTitle;
-  }
-
   const creationsCountQuery = new AV.Query('Character');
   creationsCountQuery.equalTo('author', AV.Object.createWithoutData('_User', userId));
   const creationsCount = await creationsCountQuery.count({ useMasterKey: true });
@@ -695,7 +676,7 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
   };
   let isFollowing = false;
   if (currentUser && currentUser.id !== userId) {
-    const followQuery = new AV.Query('UserFollow');
+    const followQuery = new AV.Query('UserFollow'); // 核心修改
     followQuery.equalTo('user', currentUser);
     followQuery.equalTo('followed', user);
     const followRecord = await followQuery.first();
@@ -704,7 +685,7 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
     }
   }
   return {
-    user: userJSON,
+    user: user.toJSON(),
     stats: stats,
     isFollowing: isFollowing,
   };
@@ -957,7 +938,7 @@ AV.Cloud.define('migrateAllCharactersToOwner', async (request) => {
 });
 
 // =================================================================
-// == Cloud Hook - 新用户自动加入角色
+// == Cloud Hook - 新用户自动加入角色 (调试增强版)
 // =================================================================
 
 AV.Cloud.afterSave('_User', async (request) => {
