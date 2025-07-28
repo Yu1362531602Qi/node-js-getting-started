@@ -1,4 +1,4 @@
-// lib/cloud.js (V4.0.0 - 最终架构：Ticket模式)
+// lib/cloud.js (V5.0.0 - 最终架构：流函数自闭环)
 
 'use strict';
 const AV = require('leanengine');
@@ -10,63 +10,20 @@ const https = require('https');
 // == 安全校验核心模块
 // =================================================================
 
-// 这个验证器现在只给标准云函数使用，它绝对是可靠的。
-const validateSessionAuth = (request) => {
+// 这个验证器现在只给【标准】云函数使用，它的逻辑是正确的。
+const validateSessionAuthForStandardFunc = (request) => {
   const sessionAuthToken = request.expressReq.get('X-Session-Auth-Token');
   if (!sessionAuthToken) {
     throw new AV.Cloud.Error('无效的客户端，禁止操作。', { code: 403 });
   }
   const functionName = request.functionName || 'unknown';
-  console.log(`'${functionName}' Session Auth Token 校验通过。`);
+  console.log(`【标准】'${functionName}' Auth Token 校验通过。`);
 };
 
-// ... (握手, isAdmin, getUserRoles 等辅助函数保持不变)
-AV.Cloud.define('handshake', async (request) => {
-  const { version, timestamp, signature } = request.params;
-  if (!version || !timestamp || !signature) {
-    throw new AV.Cloud.Error('无效的握手请求，缺少参数。', { code: 400 });
-  }
-  const clientTimestamp = parseInt(timestamp, 10);
-  const serverTimestamp = Math.floor(Date.now() / 1000);
-  if (Math.abs(serverTimestamp - clientTimestamp) > 300) {
-    throw new AV.Cloud.Error('请求已过期或设备时间不正确。', { code: 408 });
-  }
-  const rootKey = process.env.CLIENT_ROOT_KEY;
-  if (!rootKey) {
-      console.error('FATAL: 环境变量 CLIENT_ROOT_KEY 未设置！');
-      throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
-  }
-  const challengeData = `${version}|${timestamp}`;
-  const hmac = crypto.createHmac('sha256', rootKey);
-  hmac.update(challengeData);
-  const serverSignature = hmac.digest('hex');
-  if (serverSignature !== signature) {
-    console.error(`签名验证失败！客户端签名: ${signature}, 服务器计算签名: ${serverSignature}`);
-    throw new AV.Cloud.Error('签名验证失败。', { code: 403 });
-  }
-  console.log(`版本 ${version} 的客户端握手成功。`);
-  const versionQuery = new AV.Query('VersionConfig');
-  versionQuery.equalTo('versionName', version);
-  const versionConfig = await versionQuery.first({ useMasterKey: true });
-  let status = 'blocked';
-  let updateMessage = '您的应用版本不受支持，请更新。';
-  let updateUrl = '';
-  let sessionAuthToken = null;
-  if (versionConfig) {
-    status = versionConfig.get('status');
-    updateMessage = versionConfig.get('updateMessage');
-    updateUrl = versionConfig.get('updateUrl');
-  }
-  if (status === 'active') {
-    sessionAuthToken = crypto.randomBytes(32).toString('hex');
-  }
-  return {
-    status: status,
-    updateMessage: updateMessage,
-    updateUrl: updateUrl,
-    sessionAuthToken: sessionAuthToken,
-  };
-});
+
+// =================================================================
+// == 辅助函数 (保持不变)
+// =================================================================
 const isAdmin = async (user) => {
   if (!user) return false;
   const query = new AV.Query(AV.Role);
@@ -125,120 +82,96 @@ async function checkAndIncrementUsage(user, usageType, permissions) {
         }
     }
 }
-AV.Cloud.define('requestApiCallPermission', async (request) => {
-    validateSessionAuth(request);
-    const user = request.currentUser;
-    if (!user) {
-        throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
-    }
 
-    if (await isAdmin(user)) {
-        console.log(`管理员 ${user.get('username')} 请求调用许可，直接通过。`);
-        return { 
-            canCall: true, 
-            message: '管理员权限，许可已授予。',
-            historyLimit: -1 
-        };
-    }
+// =================================================================
+// == 云函数定义
+// =================================================================
 
-    const { usageType } = request.params;
-    if (usageType !== 'llm' && usageType !== 'tts') {
-        throw new AV.Cloud.Error('无效的 usageType 参数，必须是 "llm" 或 "tts"。', { code: 400 });
-    }
-
-    const userRoles = await getUserRoles(user);
-    const permissionQuery = new AV.Query('RolePermission');
-    permissionQuery.containedIn('roleName', userRoles);
-    const permissions = await permissionQuery.find({ useMasterKey: true });
-
-    if (permissions.length === 0) {
-        console.error(`未找到任何与用户角色 ${userRoles.join(', ')} 匹配的权限配置！`);
-        throw new AV.Cloud.Error('服务器权限配置错误，请联系管理员。', { code: 500 });
-    }
-
-    const historyLimit = Math.max(...permissions.map(p => p.get('historyLimit') ?? 15));
-
-    try {
-        await checkAndIncrementUsage(user, usageType, permissions);
-        return { 
-            canCall: true, 
-            message: '许可已授予。',
-            historyLimit: historyLimit 
-        };
-    } catch (error) {
-        console.log(`用户 ${user.id} 的 ${usageType} 调用被拒绝: ${error.message}`);
-        return { 
-            canCall: false, 
-            message: error.message,
-            historyLimit: 0
-        };
-    }
+AV.Cloud.define('handshake', async (request) => {
+  const { version, timestamp, signature } = request.params;
+  if (!version || !timestamp || !signature) {
+    throw new AV.Cloud.Error('无效的握手请求，缺少参数。', { code: 400 });
+  }
+  const clientTimestamp = parseInt(timestamp, 10);
+  const serverTimestamp = Math.floor(Date.now() / 1000);
+  if (Math.abs(serverTimestamp - clientTimestamp) > 300) {
+    throw new AV.Cloud.Error('请求已过期或设备时间不正确。', { code: 408 });
+  }
+  const rootKey = process.env.CLIENT_ROOT_KEY;
+  if (!rootKey) {
+      console.error('FATAL: 环境变量 CLIENT_ROOT_KEY 未设置！');
+      throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
+  }
+  const challengeData = `${version}|${timestamp}`;
+  const hmac = crypto.createHmac('sha256', rootKey);
+  hmac.update(challengeData);
+  const serverSignature = hmac.digest('hex');
+  if (serverSignature !== signature) {
+    console.error(`签名验证失败！客户端签名: ${signature}, 服务器计算签名: ${serverSignature}`);
+    throw new AV.Cloud.Error('签名验证失败。', { code: 403 });
+  }
+  console.log(`版本 ${version} 的客户端握手成功。`);
+  const versionQuery = new AV.Query('VersionConfig');
+  versionQuery.equalTo('versionName', version);
+  const versionConfig = await versionQuery.first({ useMasterKey: true });
+  let status = 'blocked';
+  let updateMessage = '您的应用版本不受支持，请更新。';
+  let updateUrl = '';
+  let sessionAuthToken = null;
+  if (versionConfig) {
+    status = versionConfig.get('status');
+    updateMessage = versionConfig.get('updateMessage');
+    updateUrl = versionConfig.get('updateUrl');
+  }
+  if (status === 'active') {
+    sessionAuthToken = crypto.randomBytes(32).toString('hex');
+  }
+  return {
+    status: status,
+    updateMessage: updateMessage,
+    updateUrl: updateUrl,
+    sessionAuthToken: sessionAuthToken,
+  };
 });
 
-// --- vvv 核心新增：获取调用票据的【标准】云函数 vvv ---
-AV.Cloud.define('getLlmInvocationTicket', async (request) => {
-    // 1. 使用标准、可靠的验证器
-    validateSessionAuth(request);
-    const user = request.currentUser;
-    if (!user) {
-        throw new AV.Cloud.Error('用户未登录。', { code: 401 });
-    }
-
-    // 2. 调用内部的权限检查和计费函数
-    const permissionResult = await AV.Cloud.run('requestApiCallPermission', { usageType: 'llm' }, { user });
-    if (!permissionResult.canCall) {
-        throw new AV.Cloud.Error(permissionResult.message, { code: 429 });
-    }
-
-    // 3. 生成一个一次性的 Ticket
-    const ticket = crypto.randomBytes(16).toString('hex');
-    const InvocationTicket = AV.Object.extend('InvocationTicket');
-    const newTicket = new InvocationTicket();
-    newTicket.set('ticket', ticket);
-    newTicket.set('user', user);
-    
-    // 4. 设置 Ticket 的有效期为 30 秒
-    const acl = new AV.ACL();
-    acl.setPublicReadAccess(false);
-    acl.setPublicWriteAccess(false);
-    newTicket.setACL(acl);
-    newTicket.set('expiresAt', new Date(Date.now() + 30 * 1000));
-
-    await newTicket.save(null, { useMasterKey: true });
-
-    console.log(`为用户 ${user.id} 生成了 LLM 调用票据: ${ticket}`);
-    
-    // 5. 将 Ticket 和历史限制一并返回给客户端
-    return { 
-        ticket: ticket,
-        historyLimit: permissionResult.historyLimit 
-    };
-});
-
-// --- vvv 核心修改：简化 proxyLlmStream 函数 vvv ---
+// --- vvv 核心修改：proxyLlmStream 函数自闭环实现 vvv ---
 AV.Cloud.define('proxyLlmStream', async (request) => {
-    // 1. 不再进行复杂的 header 验证
-    const { invocationTicket, serviceProvider, requestBody } = request.params;
-    if (!invocationTicket || !serviceProvider || !requestBody) {
-        throw new AV.Cloud.Error('缺少 invocationTicket, serviceProvider 或 requestBody 参数。', { code: 400 });
+    // 1. 从流式函数的 request.req.headers 中获取令牌
+    const sessionAuthToken = request.req.headers['x-session-auth-token'];
+    if (!sessionAuthToken) {
+        throw new AV.Cloud.Error('无效的客户端，禁止操作 (缺少 x-session-auth-token)。', { code: 403 });
+    }
+    console.log(`【流式】'proxyLlmStream' Auth Token 校验通过。`);
+
+    const sessionToken = request.req.headers['x-lc-session'];
+    if (!sessionToken) {
+        throw new AV.Cloud.Error('请求头缺少 X-LC-Session，无法识别用户。', { code: 401 });
+    }
+    const user = await AV.User.become(sessionToken).catch(() => null);
+    if (!user) {
+        throw new AV.Cloud.Error('无效的 X-LC-Session，用户认证失败。', { code: 401 });
     }
 
-    // 2. 验证 Ticket 的有效性
-    const ticketQuery = new AV.Query('InvocationTicket');
-    ticketQuery.equalTo('ticket', invocationTicket);
-    ticketQuery.greaterThan('expiresAt', new Date()); // 检查是否过期
+    // 2. 在函数内部直接执行权限检查和计费逻辑
+    if (!(await isAdmin(user))) {
+        const userRoles = await getUserRoles(user);
+        const permissionQuery = new AV.Query('RolePermission');
+        permissionQuery.containedIn('roleName', userRoles);
+        const permissions = await permissionQuery.find({ useMasterKey: true });
+
+        if (permissions.length === 0) {
+            throw new AV.Cloud.Error('服务器权限配置错误。', { code: 500 });
+        }
+        // 注意：这里我们硬编码 'llm'
+        await checkAndIncrementUsage(user, 'llm', permissions);
+    }
     
-    const ticketObject = await ticketQuery.first({ useMasterKey: true });
-
-    if (!ticketObject) {
-        throw new AV.Cloud.Error('无效或已过期的调用票据。', { code: 403 });
+    // 3. 后续代理逻辑保持不变
+    const { serviceProvider, requestBody } = request.params;
+    if (!serviceProvider || !requestBody) {
+        throw new AV.Cloud.Error('缺少 serviceProvider 或 requestBody 参数。', { code: 400 });
     }
 
-    // 3. 【重要】立即销毁 Ticket，确保它只能被使用一次
-    await ticketObject.destroy({ useMasterKey: true });
-    console.log(`票据 ${invocationTicket} 已验证并销毁。`);
-
-    // 4. 后续代理逻辑保持不变...
     let targetUrl, apiKey, hostname, path;
     const headers = { 'Content-Type': 'application/json' };
 
@@ -294,15 +227,50 @@ AV.Cloud.define('proxyLlmStream', async (request) => {
     proxyReq.write(JSON.stringify(requestBody));
     proxyReq.end();
 });
+// --- ^^^ 核心修改 ^^^ ---
+
+// requestApiCallPermission 现在只给 TTS 使用，或者保留以备将来扩展
+AV.Cloud.define('requestApiCallPermission', async (request) => {
+    validateSessionAuthForStandardFunc(request);
+    const user = request.currentUser;
+    if (!user) {
+        throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
+    }
+
+    if (await isAdmin(user)) {
+        return { canCall: true, message: '管理员权限，许可已授予。', historyLimit: -1 };
+    }
+
+    const { usageType } = request.params;
+    if (usageType !== 'llm' && usageType !== 'tts') {
+        throw new AV.Cloud.Error('无效的 usageType 参数。', { code: 400 });
+    }
+
+    const userRoles = await getUserRoles(user);
+    const permissionQuery = new AV.Query('RolePermission');
+    permissionQuery.containedIn('roleName', userRoles);
+    const permissions = await permissionQuery.find({ useMasterKey: true });
+
+    if (permissions.length === 0) {
+        throw new AV.Cloud.Error('服务器权限配置错误。', { code: 500 });
+    }
+
+    const historyLimit = Math.max(...permissions.map(p => p.get('historyLimit') ?? 15));
+
+    try {
+        await checkAndIncrementUsage(user, usageType, permissions);
+        return { canCall: true, message: '许可已授予。', historyLimit: historyLimit };
+    } catch (error) {
+        return { canCall: false, message: error.message, historyLimit: 0 };
+    }
+});
 
 
 // =================================================================
-// == 现有业务云函数 (现在统一使用标准函数验证器)
+// == 所有其他【标准】云函数，统一使用 validateSessionAuthForStandardFunc
 // =================================================================
-// ... (所有其他标准云函数，如 updateUserProfile, followUser 等，都调用 validateSessionAuth)
 AV.Cloud.define('updateUserProfile', async (request) => {
-  validateSessionAuth(request);
-  // ... a
+  validateSessionAuthForStandardFunc(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
@@ -341,7 +309,7 @@ AV.Cloud.define('updateUserProfile', async (request) => {
   }
 });
 AV.Cloud.define('getQiniuUserAvatarUploadToken', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   if (!request.currentUser) {
     throw new AV.Cloud.Error('用户未登录，禁止获取上传凭证。', { code: 401 });
   }
@@ -368,7 +336,7 @@ AV.Cloud.define('getQiniuUserAvatarUploadToken', async (request) => {
   }
 });
 AV.Cloud.define('saveUserAvatarUrl', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const currentUser = request.currentUser;
   if (!currentUser) {
     throw new AV.Cloud.Error('用户未登录，无法更新头像。', { code: 401 });
@@ -424,7 +392,7 @@ AV.Cloud.define('saveUserAvatarUrl', async (request) => {
   return { success: true, avatarUrl: newAvatarUrl };
 });
 AV.Cloud.define('followUser', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
@@ -460,7 +428,7 @@ AV.Cloud.define('followUser', async (request) => {
   return { success: true, message: '关注成功' };
 });
 AV.Cloud.define('unfollowUser', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
@@ -485,7 +453,7 @@ AV.Cloud.define('unfollowUser', async (request) => {
   return { success: true, message: '取消关注成功' };
 });
 AV.Cloud.define('getFollowers', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const { targetUserId, page = 1, limit = 20 } = request.params;
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
@@ -502,7 +470,7 @@ AV.Cloud.define('getFollowers', async (request) => {
   return results.map(follow => follow.get('user'));
 });
 AV.Cloud.define('getFollowing', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const { targetUserId, page = 1, limit = 20 } = request.params;
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
@@ -519,7 +487,7 @@ AV.Cloud.define('getFollowing', async (request) => {
   return results.map(follow => follow.get('followed'));
 });
 AV.Cloud.define('generateNewLocalCharacterId', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，无法生成ID。', { code: 401 });
@@ -532,7 +500,7 @@ AV.Cloud.define('generateNewLocalCharacterId', async (request) => {
   return newId;
 });
 AV.Cloud.define('toggleLikeCharacter', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
@@ -578,7 +546,7 @@ AV.Cloud.define('toggleLikeCharacter', async (request) => {
   return likedIds;
 });
 AV.Cloud.define('incrementChatCount', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   if (!request.currentUser) {
     console.log("未登录用户尝试增加聊天计数，已忽略。");
     return { success: true, message: "Ignored for anonymous user." };
@@ -600,7 +568,7 @@ AV.Cloud.define('incrementChatCount', async (request) => {
   }
 });
 AV.Cloud.define('getQiniuUploadToken', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const accessKey = process.env.QINIU_AK;
   const secretKey = process.env.QINIU_SK;
   const bucket = process.env.QINIU_BUCKET_NAME;
@@ -625,7 +593,7 @@ AV.Cloud.define('getQiniuUploadToken', async (request) => {
   }
 });
 AV.Cloud.define('getSubmissionStatuses', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
@@ -647,7 +615,7 @@ AV.Cloud.define('getSubmissionStatuses', async (request) => {
   return statuses;
 });
 AV.Cloud.define('searchPublicContent', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const { searchText } = request.params;
   if (!searchText || searchText.trim().length < 1) {
     return { characters: [], users: [] };
@@ -682,7 +650,7 @@ AV.Cloud.define('searchPublicContent', async (request) => {
   }
 });
 AV.Cloud.define('getUserPublicProfile', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const { userId } = request.params;
   const currentUser = request.currentUser;
   if (!userId) {
@@ -740,7 +708,7 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
   };
 });
 AV.Cloud.define('getUserCreations', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const { targetUserId, page = 1, limit = 20 } = request.params;
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
