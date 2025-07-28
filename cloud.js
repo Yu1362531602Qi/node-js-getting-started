@@ -9,38 +9,6 @@ const crypto = require('crypto');
 // == 安全校验核心模块
 // =================================================================
 
-// --- vvv 核心新增：头衔系统核心辅助函数 vvv ---
-const getHighestPriorityTitle = async (user) => {
-    if (!user) return null;
-
-    const userRoles = await getUserRoles(user);
-    
-    // 定义角色的优先级，越靠前优先级越高
-    const rolePriority = ['Admin', '赞助者', 'User'];
-
-    const permissionQuery = new AV.Query('RolePermission');
-    permissionQuery.containedIn('roleName', userRoles);
-    permissionQuery.select(['roleName', 'title']);
-    const permissions = await permissionQuery.find({ useMasterKey: true });
-
-    if (permissions.length === 0) return null;
-
-    // 将权限转换为 Map 方便查找
-    const permissionMap = new Map(permissions.map(p => [p.get('roleName'), p.get('title')]));
-
-    // 按照优先级顺序查找第一个有效的头衔
-    for (const roleName of rolePriority) {
-        if (userRoles.includes(roleName)) {
-            const title = permissionMap.get(roleName);
-            if (title && title.trim().length > 0) {
-                return title; // 找到了，立即返回
-            }
-        }
-    }
-
-    return null; // 没有找到任何有效头衔
-};
-
 const validateSessionAuth = (request) => {
   const sessionAuthToken = request.expressReq.get('X-Session-Auth-Token');
   if (!sessionAuthToken) {
@@ -225,6 +193,37 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
 });
 // --- ^^^ 核心修改 ^^^ ---
 
+// --- vvv 核心新增：头衔系统核心辅助函数 vvv ---
+const getHighestPriorityTitle = async (user) => {
+    if (!user) return null;
+
+    const userRoles = await getUserRoles(user);
+    
+    // 定义角色的优先级，越靠前优先级越高
+    const rolePriority = ['Admin', '赞助者', 'User'];
+
+    const permissionQuery = new AV.Query('RolePermission');
+    permissionQuery.containedIn('roleName', userRoles);
+    permissionQuery.select(['roleName', 'title']);
+    const permissions = await permissionQuery.find({ useMasterKey: true });
+
+    if (permissions.length === 0) return null;
+
+    // 将权限转换为 Map 方便查找
+    const permissionMap = new Map(permissions.map(p => [p.get('roleName'), p.get('title')]));
+
+    // 按照优先级顺序查找第一个有效的头衔
+    for (const roleName of rolePriority) {
+        if (userRoles.includes(roleName)) {
+            const title = permissionMap.get(roleName);
+            if (title && title.trim().length > 0) {
+                return title; // 找到了，立即返回
+            }
+        }
+    }
+
+    return null; // 没有找到任何有效头衔
+};
 
 // =================================================================
 // == 现有业务云函数 (无需修改，保持原样)
