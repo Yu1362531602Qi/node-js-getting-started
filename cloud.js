@@ -1,4 +1,4 @@
-// lib/cloud.js (V3.5.0 - 全新架构：分离标准与流式函数鉴权)
+// lib/cloud.js (V3.6.0 - 最终架构：统一兼容的鉴权器)
 
 'use strict';
 const AV = require('leanengine');
@@ -10,42 +10,33 @@ const https = require('https');
 // == 安全校验核心模块
 // =================================================================
 
-// --- vvv 核心修改：创建两个独立的验证函数 vvv ---
+// --- vvv 核心最终修正：一个能处理所有情况的统一验证函数 vvv ---
+const validateSessionAuth = (request) => {
+  let sessionAuthToken;
+  const headerName = 'X-Session-Auth-Token';
+  const lowerCaseHeaderName = 'x-session-auth-token';
 
-/**
- * 用于【标准】云函数的安全校验。
- * 它依赖 request.expressReq 对象，能正确解析用户会话。
- */
-const validateSessionAuthForStandardFunc = (request) => {
-  // 从 expressReq 获取 header，这是标准云函数的正确方式
-  const sessionAuthToken = request.expressReq.get('X-Session-Auth-Token');
-  
+  // 智能环境判断
+  if (request.expressReq && typeof request.expressReq.get === 'function') {
+    // 路径 A: 这是标准云函数
+    sessionAuthToken = request.expressReq.get(headerName);
+  } else if (request.req && request.req.headers) {
+    // 路径 B: 这是流式云函数 (或类似环境)
+    sessionAuthToken = request.req.headers[lowerCaseHeaderName];
+  }
+
   if (!sessionAuthToken) {
-    console.error('【标准函数】安全校验失败：请求头中缺少 X-Session-Auth-Token。');
+    // 如果还是找不到，提供详细的调试日志
+    console.error('安全校验失败：请求中缺少 X-Session-Auth-Token。');
+    console.log('Request object keys:', Object.keys(request)); // 打印 request 对象的所有顶级键
+    if(request.req) console.log('request.req.headers:', request.req.headers); // 打印原始请求头
     throw new AV.Cloud.Error('无效的客户端，禁止操作。', { code: 403 });
   }
   
   const functionName = request.functionName || 'unknown';
-  console.log(`【标准函数】'${functionName}' Session Auth Token 校验通过。`);
+  console.log(`'${functionName}' Session Auth Token 校验通过。`);
 };
-
-/**
- * 用于【流式】云函数的安全校验。
- * 它直接从 request.headers 获取，因为流式函数没有 expressReq。
- */
-const validateSessionAuthForStreamFunc = (request) => {
-    // 从 headers 对象获取（key 已被转为小写）
-    const sessionAuthToken = request.headers['x-session-auth-token'];
-
-    if (!sessionAuthToken) {
-        console.error('【流式函数】安全校验失败：请求头中缺少 X-Session-Auth-Token。');
-        throw new AV.Cloud.Error('无效的客户端，禁止操作。', { code: 403 });
-    }
-    
-    const functionName = request.functionName || 'unknown';
-    console.log(`【流式函数】'${functionName}' Session Auth Token 校验通过。`);
-};
-// --- ^^^ 核心修改 ^^^ ---
+// --- ^^^ 核心最终修正 ^^^ ---
 
 
 AV.Cloud.define('handshake', async (request) => {
@@ -166,7 +157,7 @@ async function checkAndIncrementUsage(user, usageType, permissions) {
 }
 
 AV.Cloud.define('requestApiCallPermission', async (request) => {
-    validateSessionAuthForStandardFunc(request); // 使用标准函数验证器
+    validateSessionAuth(request); // 所有标准函数都调用这个统一验证器
     const user = request.currentUser;
     if (!user) {
         throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
@@ -215,30 +206,28 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
     }
 });
 
-// --- vvv 核心修改：proxyLlmStream 函数的鉴权逻辑 vvv ---
 AV.Cloud.define('proxyLlmStream', async (request) => {
-    // 1. 对流式函数本身，只做最基础的令牌存在性检查
-    validateSessionAuthForStreamFunc(request);
+    validateSessionAuth(request); // 流式函数也调用这个统一验证器
     
-    // 2. 获取当前用户信息。注意：对于流式函数，我们需要手动从 sessionToken 构建用户对象
-    const sessionToken = request.headers['x-lc-session'];
+    // 在流式函数中，我们必须手动从 header 中获取 session token 并恢复用户对象
+    const sessionToken = request.req.headers['x-lc-session'];
     if (!sessionToken) {
         throw new AV.Cloud.Error('请求头缺少 X-LC-Session，无法识别用户。', { code: 401 });
     }
-    const user = await AV.User.become(sessionToken).catch(() => null);
+    const user = await AV.User.become(sessionToken).catch((err) => {
+        console.error("通过 X-LC-Session 恢复用户失败:", err);
+        return null;
+    });
     if (!user) {
         throw new AV.Cloud.Error('无效的 X-LC-Session，用户认证失败。', { code: 401 });
     }
     
-    // 3. 【信任链核心】调用标准的、可靠的 requestApiCallPermission 函数进行权限检查和计费
-    // 我们将 user 对象传递给它，让它在正确的用户上下文中运行
+    // 【信任链核心】调用标准的、可靠的 requestApiCallPermission 函数进行权限检查和计费
     const permissionResult = await AV.Cloud.run('requestApiCallPermission', { usageType: 'llm' }, { user });
     if (!permissionResult.canCall) {
-        // 如果没权限，直接抛出错误，终止执行
         throw new AV.Cloud.Error(permissionResult.message, { code: 429 });
     }
     
-    // 4. 后续代理逻辑保持不变...
     const { serviceProvider, requestBody } = request.params;
     if (!serviceProvider || !requestBody) {
         throw new AV.Cloud.Error('缺少 serviceProvider 或 requestBody 参数。', { code: 400 });
@@ -299,7 +288,6 @@ AV.Cloud.define('proxyLlmStream', async (request) => {
     proxyReq.write(JSON.stringify(requestBody));
     proxyReq.end();
 });
-// --- ^^^ 核心修改 ^^^ ---
 
 
 // =================================================================
@@ -312,7 +300,7 @@ AV.Cloud.define('hello', function(request) {
 
 // --- 用户与个人资料 ---
 AV.Cloud.define('updateUserProfile', async (request) => {
-  validateSessionAuthForStandardFunc(request);
+  validateSessionAuth(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
@@ -352,7 +340,7 @@ AV.Cloud.define('updateUserProfile', async (request) => {
 });
 
 AV.Cloud.define('getQiniuUserAvatarUploadToken', async (request) => {
-  validateSessionAuthForStandardFunc(request);
+  validateSessionAuth(request);
   if (!request.currentUser) {
     throw new AV.Cloud.Error('用户未登录，禁止获取上传凭证。', { code: 401 });
   }
@@ -380,7 +368,7 @@ AV.Cloud.define('getQiniuUserAvatarUploadToken', async (request) => {
 });
 
 AV.Cloud.define('saveUserAvatarUrl', async (request) => {
-  validateSessionAuthForStandardFunc(request);
+  validateSessionAuth(request);
   const currentUser = request.currentUser;
   if (!currentUser) {
     throw new AV.Cloud.Error('用户未登录，无法更新头像。', { code: 401 });
@@ -438,7 +426,7 @@ AV.Cloud.define('saveUserAvatarUrl', async (request) => {
 
 // --- 关注/粉丝相关云函数 ---
 AV.Cloud.define('followUser', async (request) => {
-  validateSessionAuthForStandardFunc(request);
+  validateSessionAuth(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
@@ -475,7 +463,7 @@ AV.Cloud.define('followUser', async (request) => {
 });
 
 AV.Cloud.define('unfollowUser', async (request) => {
-  validateSessionAuthForStandardFunc(request);
+  validateSessionAuth(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
@@ -501,7 +489,7 @@ AV.Cloud.define('unfollowUser', async (request) => {
 });
 
 AV.Cloud.define('getFollowers', async (request) => {
-  validateSessionAuthForStandardFunc(request);
+  validateSessionAuth(request);
   const { targetUserId, page = 1, limit = 20 } = request.params;
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
@@ -519,7 +507,7 @@ AV.Cloud.define('getFollowers', async (request) => {
 });
 
 AV.Cloud.define('getFollowing', async (request) => {
-  validateSessionAuthForStandardFunc(request);
+  validateSessionAuth(request);
   const { targetUserId, page = 1, limit = 20 } = request.params;
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
@@ -538,7 +526,7 @@ AV.Cloud.define('getFollowing', async (request) => {
 
 // --- 角色与创作管理 ---
 AV.Cloud.define('generateNewLocalCharacterId', async (request) => {
-  validateSessionAuthForStandardFunc(request);
+  validateSessionAuth(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，无法生成ID。', { code: 401 });
@@ -552,7 +540,7 @@ AV.Cloud.define('generateNewLocalCharacterId', async (request) => {
 });
 
 AV.Cloud.define('toggleLikeCharacter', async (request) => {
-  validateSessionAuthForStandardFunc(request);
+  validateSessionAuth(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
@@ -599,7 +587,7 @@ AV.Cloud.define('toggleLikeCharacter', async (request) => {
 });
 
 AV.Cloud.define('incrementChatCount', async (request) => {
-  validateSessionAuthForStandardFunc(request);
+  validateSessionAuth(request);
   if (!request.currentUser) {
     console.log("未登录用户尝试增加聊天计数，已忽略。");
     return { success: true, message: "Ignored for anonymous user." };
@@ -622,7 +610,7 @@ AV.Cloud.define('incrementChatCount', async (request) => {
 });
 
 AV.Cloud.define('getQiniuUploadToken', async (request) => {
-  validateSessionAuthForStandardFunc(request);
+  validateSessionAuth(request);
   const accessKey = process.env.QINIU_AK;
   const secretKey = process.env.QINIU_SK;
   const bucket = process.env.QINIU_BUCKET_NAME;
@@ -648,7 +636,7 @@ AV.Cloud.define('getQiniuUploadToken', async (request) => {
 });
 
 AV.Cloud.define('getSubmissionStatuses', async (request) => {
-  validateSessionAuthForStandardFunc(request);
+  validateSessionAuth(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
@@ -672,7 +660,7 @@ AV.Cloud.define('getSubmissionStatuses', async (request) => {
 
 // --- 搜索功能 ---
 AV.Cloud.define('searchPublicContent', async (request) => {
-  validateSessionAuthForStandardFunc(request);
+  validateSessionAuth(request);
   const { searchText } = request.params;
   if (!searchText || searchText.trim().length < 1) {
     return { characters: [], users: [] };
@@ -709,7 +697,7 @@ AV.Cloud.define('searchPublicContent', async (request) => {
 
 // --- 用户主页 ---
 AV.Cloud.define('getUserPublicProfile', async (request) => {
-  validateSessionAuthForStandardFunc(request);
+  validateSessionAuth(request);
   const { userId } = request.params;
   const currentUser = request.currentUser;
   if (!userId) {
@@ -768,7 +756,7 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
 });
 
 AV.Cloud.define('getUserCreations', async (request) => {
-  validateSessionAuthForStandardFunc(request);
+  validateSessionAuth(request);
   const { targetUserId, page = 1, limit = 20 } = request.params;
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
