@@ -1,9 +1,10 @@
-// cloud.js (V3.3 - 增加历史对话轮数限制)
+// lib/cloud.js (V3.4 - 引入安全API代理)
 
 'use strict';
 const AV = require('leanengine');
 const qiniu = require('qiniu');
 const crypto = require('crypto');
+const https = require('https'); // 引入 Node.js 的 https 模块用于流式请求
 
 // =================================================================
 // == 安全校验核心模块
@@ -134,7 +135,6 @@ async function checkAndIncrementUsage(user, usageType, permissions) {
     }
 }
 
-// --- vvv 核心修改：requestApiCallPermission 函数 vvv ---
 AV.Cloud.define('requestApiCallPermission', async (request) => {
     validateSessionAuth(request);
     const user = request.currentUser;
@@ -142,13 +142,12 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
     }
 
-    // 1. 管理员直接拥有无限权限
     if (await isAdmin(user)) {
         console.log(`管理员 ${user.get('username')} 请求调用许可，直接通过。`);
         return { 
             canCall: true, 
             message: '管理员权限，许可已授予。',
-            historyLimit: -1 // -1 代表无限制
+            historyLimit: -1 
         };
     }
 
@@ -157,7 +156,6 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         throw new AV.Cloud.Error('无效的 usageType 参数，必须是 "llm" 或 "tts"。', { code: 400 });
     }
 
-    // 2. 获取用户角色和对应的权限配置
     const userRoles = await getUserRoles(user);
     const permissionQuery = new AV.Query('RolePermission');
     permissionQuery.containedIn('roleName', userRoles);
@@ -168,14 +166,10 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         throw new AV.Cloud.Error('服务器权限配置错误，请联系管理员。', { code: 500 });
     }
 
-    // 3. 计算历史对话轮数限制 (取用户所有角色中最高的那个值)
-    // 如果 historyLimit 字段不存在，则默认为 15
     const historyLimit = Math.max(...permissions.map(p => p.get('historyLimit') ?? 15));
 
-    // 4. 检查并增加每日调用次数
     try {
         await checkAndIncrementUsage(user, usageType, permissions);
-        // 5. 如果检查通过，返回成功以及计算出的历史轮数限制
         return { 
             canCall: true, 
             message: '许可已授予。',
@@ -183,15 +177,99 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         };
     } catch (error) {
         console.log(`用户 ${user.id} 的 ${usageType} 调用被拒绝: ${error.message}`);
-        // 6. 如果检查不通过，返回失败
         return { 
             canCall: false, 
             message: error.message,
-            historyLimit: 0 // 调用被拒绝时，轮数限制为0
+            historyLimit: 0
         };
     }
 });
-// --- ^^^ 核心修改 ^^^ ---
+
+// --- vvv 核心新增：API 代理云函数 vvv ---
+AV.Cloud.define('proxyLlmStream', async (request) => {
+    // 1. 安全校验
+    validateSessionAuth(request);
+    const user = request.currentUser;
+    if (!user) {
+        throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
+    }
+
+    // 2. 权限和次数检查 (复用现有逻辑)
+    // 注意：这里我们硬编码 'llm'，因为此函数专用于语言模型代理
+    const permissionResult = await AV.Cloud.run('requestApiCallPermission', { usageType: 'llm' }, { user });
+    if (!permissionResult.canCall) {
+        // 如果没权限，直接抛出从 requestApiCallPermission 返回的错误信息
+        throw new AV.Cloud.Error(permissionResult.message, { code: 429 });
+    }
+    
+    // 3. 获取前端传递的参数
+    const { serviceProvider, requestBody } = request.params;
+    if (!serviceProvider || !requestBody) {
+        throw new AV.Cloud.Error('缺少 serviceProvider 或 requestBody 参数。', { code: 400 });
+    }
+
+    // 4. 根据服务商选择 API Key 和 URL
+    let targetUrl, apiKey, hostname, path;
+    const headers = { 'Content-Type': 'application/json' };
+
+    switch (serviceProvider) {
+        case 'deepseek':
+            targetUrl = 'https://api.deepseek.com/chat/completions';
+            apiKey = process.env.DEEPSEEK_API_KEY;
+            headers['Authorization'] = `Bearer ${apiKey}`;
+            break;
+        case 'siliconflow':
+            targetUrl = 'https://api.siliconflow.cn/v1/chat/completions';
+            apiKey = process.env.SILICONFLOW_API_KEY;
+            headers['Authorization'] = `Bearer ${apiKey}`;
+            break;
+        case 'gemini':
+            targetUrl = 'https://api.ssopen.top/v1/chat/completions';
+            apiKey = process.env.GEMINI_API_KEY;
+            headers['Authorization'] = `Bearer ${apiKey}`;
+            break;
+        default:
+            throw new AV.Cloud.Error('不支持的服务提供商。', { code: 400 });
+    }
+
+    if (!apiKey) {
+        console.error(`环境变量中未找到 ${serviceProvider.toUpperCase()}_API_KEY`);
+        throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
+    }
+
+    // 5. 解析目标 URL 以便使用 https 模块
+    const url = new URL(targetUrl);
+    hostname = url.hostname;
+    path = url.pathname;
+
+    // 6. 发起流式请求并代理回客户端
+    const options = {
+        hostname: hostname,
+        path: path,
+        method: 'POST',
+        headers: headers,
+    };
+
+    const proxyReq = https.request(options, (proxyRes) => {
+        // 将目标服务器的响应头和状态码原样返回给客户端
+        request.response.status(proxyRes.statusCode);
+        for (const key in proxyRes.headers) {
+            request.response.set(key, proxyRes.headers[key]);
+        }
+        // 将目标服务器的响应体数据流直接 pipe 到客户端的响应流中
+        proxyRes.pipe(request.response);
+    });
+
+    proxyReq.on('error', (e) => {
+        console.error(`代理请求到 ${serviceProvider} 时发生错误: ${e.message}`);
+        request.response.status(500).send(`代理请求失败: ${e.message}`);
+    });
+
+    // 写入从前端收到的请求体
+    proxyReq.write(JSON.stringify(requestBody));
+    proxyReq.end();
+});
+// --- ^^^ 核心新增 ^^^ ---
 
 
 // =================================================================
