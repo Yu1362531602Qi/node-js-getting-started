@@ -1,40 +1,21 @@
-// cloud.js (V4.4 - Logic Extraction for Express Route)
+// cloud.js (V3.3 - 增加历史对话轮数限制)
 
 'use strict';
 const AV = require('leanengine');
 const qiniu = require('qiniu');
 const crypto = require('crypto');
-const fetch = require('node-fetch');
 
 // =================================================================
-// == 模块导出 (新增)
+// == 安全校验核心模块
 // =================================================================
-// 我们将需要被 Express 路由使用的函数导出
-module.exports.streamProxyApiCallHandler = streamProxyApiCallHandler;
-
-// =================================================================
-// == 安全与配置模块
-// =================================================================
-
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
-const SILICONFLOW_API_KEY = process.env.SILICONFLOW_API_KEY;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY;
-const MINIMAX_GROUP_ID = process.env.MINIMAX_GROUP_ID;
-
-const API_ENDPOINTS = {
-  deepseek: 'https://api.deepseek.com/chat/completions',
-  siliconflow: 'https://api.siliconflow.cn/v1/chat/completions',
-  gemini: 'https://api.ssopen.top/v1/chat/completions',
-  minimax_tts: `https://api.minimaxi.com/v1/t2a_v2?GroupId=${MINIMAX_GROUP_ID}`,
-};
 
 const validateSessionAuth = (request) => {
-  // 对于 Express 请求，req.get() 是正确的方法
   const sessionAuthToken = request.expressReq.get('X-Session-Auth-Token');
   if (!sessionAuthToken) {
     throw new AV.Cloud.Error('无效的客户端，禁止操作。', { code: 403 });
   }
+  const functionName = request.functionName || 'unknown';
+  console.log(`Session Auth Token 校验通过，函数: ${functionName}`);
 };
 
 AV.Cloud.define('handshake', async (request) => {
@@ -60,6 +41,7 @@ AV.Cloud.define('handshake', async (request) => {
     console.error(`签名验证失败！客户端签名: ${signature}, 服务器计算签名: ${serverSignature}`);
     throw new AV.Cloud.Error('签名验证失败。', { code: 403 });
   }
+  console.log(`版本 ${version} 的客户端握手成功。`);
   const versionQuery = new AV.Query('VersionConfig');
   versionQuery.equalTo('versionName', version);
   const versionConfig = await versionQuery.first({ useMasterKey: true });
@@ -83,6 +65,8 @@ AV.Cloud.define('handshake', async (request) => {
   };
 });
 
+
+// --- 辅助函数：检查用户是否为管理员 ---
 const isAdmin = async (user) => {
   if (!user) return false;
   const query = new AV.Query(AV.Role);
@@ -92,6 +76,7 @@ const isAdmin = async (user) => {
   return count > 0;
 };
 
+// --- 辅助函数：获取用户角色列表 ---
 const getUserRoles = async (user) => {
     if (!user) return ['User'];
     const roleQuery = new AV.Query(AV.Role);
@@ -104,190 +89,119 @@ const getUserRoles = async (user) => {
     return roleNames;
 };
 
+
 // =================================================================
-// == API 调用代理核心模块
+// == API 调用限制模块
 // =================================================================
 
-async function checkApiPermission(user, usageType) {
-    if (await isAdmin(user)) {
-        return { canCall: true, message: '管理员权限，许可已授予。', historyLimit: -1 };
-    }
-
-    const userRoles = await getUserRoles(user);
-    const permissionQuery = new AV.Query('RolePermission');
-    permissionQuery.containedIn('roleName', userRoles);
-    const permissions = await permissionQuery.find({ useMasterKey: true });
-
-    if (permissions.length === 0) {
-        throw new AV.Cloud.Error('服务器权限配置错误，请联系管理员。', { code: 500 });
-    }
-
-    const historyLimit = Math.max(...permissions.map(p => p.get('historyLimit') ?? 15));
-    
+async function checkAndIncrementUsage(user, usageType, permissions) {
     const today = new Date().toISOString().slice(0, 10);
     const lastCallDate = user.get('lastCallDate');
     const usageCountField = `${usageType}CallCount`;
     let currentUsage = user.get(usageCountField) || 0;
+    let needsSave = false;
 
     if (lastCallDate !== today) {
+        console.log(`用户 ${user.id} 在新的一天 (${today}) 首次调用，重置所有计数器。`);
         user.set('lastCallDate', today);
         user.set('llmCallCount', 0);
         user.set('ttsCallCount', 0);
         currentUsage = 0;
+        needsSave = true;
     }
 
     const limitField = `${usageType}Limit`;
     const dailyLimit = Math.max(...permissions.map(p => p.get(limitField) || 0));
+    const userRoles = permissions.map(p => p.get('roleName'));
+
+    console.log(`用户 ${user.id} (角色: ${userRoles.join(', ')}) 的 ${usageType} 限额为 ${dailyLimit}，当前已用 ${currentUsage}`);
 
     if (currentUsage >= dailyLimit) {
         throw new AV.Cloud.Error(`您今日的${usageType === 'llm' ? '语言模型' : '语音'}调用次数已达上限 (${dailyLimit}次)。`, { code: 429 });
     }
 
     user.increment(usageCountField, 1);
+    needsSave = true;
     
-    return { canCall: true, message: '许可已授予。', historyLimit: historyLimit };
-}
-
-async function streamProxyApiCallHandler(req, res) {
-    try {
-        validateSessionAuth({ expressReq: req });
-        
-        const sessionToken = req.headers['x-lc-session'];
-        if (!sessionToken) {
-            return res.status(401).json({ code: 401, error: '用户未登录，禁止操作。' });
-        }
-        const user = await AV.User.become(sessionToken, { useMasterKey: true });
-
-        const { apiService, modelName, messages, temperature } = req.body;
-
-        const permission = await checkApiPermission(user, 'llm');
-        
-        const endpoint = API_ENDPOINTS[apiService];
-        let apiKey;
-        switch(apiService) {
-            case 'deepseek': apiKey = DEEPSEEK_API_KEY; break;
-            case 'siliconflow': apiKey = SILICONFLOW_API_KEY; break;
-            case 'gemini': apiKey = GEMINI_API_KEY; break;
-            default:
-                throw new AV.Cloud.Error('不支持的 apiService 类型。', { code: 400 });
-        }
-
-        if (!endpoint || !apiKey) {
-            console.error(`服务器配置错误: apiService "${apiService}" 缺少 endpoint 或 apiKey。`);
-            throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
-        }
-
-        const truncatedMessages = messages.length > permission.historyLimit && permission.historyLimit !== -1
-            ? [messages[0], ...messages.slice(-(permission.historyLimit * 2))]
-            : messages;
-
-        const body = JSON.stringify({
-            model: modelName,
-            messages: truncatedMessages,
-            temperature: temperature || 1.0,
-            stream: true,
-        });
-
-        const apiResponse = await fetch(endpoint, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`,
-            },
-            body: body,
-        });
-
-        if (!apiResponse.ok) {
-            const errorText = await apiResponse.text();
-            console.error(`请求第三方API失败 (${apiResponse.status}): ${errorText}`);
-            throw new AV.Cloud.Error(`AI服务商返回错误: ${apiResponse.statusText}`, { code: 502 });
-        }
-
-        res.setHeader('Content-Type', 'application/octet-stream');
-        apiResponse.body.pipe(res);
-
-        apiResponse.body.on('end', () => {
-            user.save(null, { useMasterKey: true })
-                .then(() => console.log(`用户 ${user.id} 的 llmCallCount 计数更新成功。`))
-                .catch(saveError => console.error(`为用户 ${user.id} 更新用量计数失败:`, saveError));
-        });
-
-        apiResponse.body.on('error', (err) => {
-            console.error('代理流传输过程中发生错误:', err);
-            if (!res.headersSent) {
-                res.status(500).json({ code: 500, error: '流传输错误' });
-            }
-        });
-
-    } catch (error) {
-        console.error(`streamProxyApiCallHandler 错误: ${error.message}`);
-        if (!res.headersSent) {
-            const errorCode = error.code || 500;
-            res.status(errorCode).json({ code: errorCode, error: error.message });
+    if (needsSave) {
+        try {
+            await user.save(null, { useMasterKey: true });
+            console.log(`用户 ${user.id} 的 ${usageCountField} 计数更新成功。`);
+        } catch (error) {
+            console.error(`为用户 ${user.id} 更新用量计数失败:`, error);
+            throw new AV.Cloud.Error('更新用户用量失败，请重试。', { code: 500 });
         }
     }
 }
 
-AV.Cloud.define('proxyTtsApiCall', async (request) => {
+// --- vvv 核心修改：requestApiCallPermission 函数 vvv ---
+AV.Cloud.define('requestApiCallPermission', async (request) => {
     validateSessionAuth(request);
     const user = request.currentUser;
     if (!user) {
         throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
     }
 
-    const { requestBody } = request.params;
-    if (!requestBody || !requestBody.text) {
-        throw new AV.Cloud.Error('无效的请求体。', { code: 400 });
+    // 1. 管理员直接拥有无限权限
+    if (await isAdmin(user)) {
+        console.log(`管理员 ${user.get('username')} 请求调用许可，直接通过。`);
+        return { 
+            canCall: true, 
+            message: '管理员权限，许可已授予。',
+            historyLimit: -1 // -1 代表无限制
+        };
     }
 
+    const { usageType } = request.params;
+    if (usageType !== 'llm' && usageType !== 'tts') {
+        throw new AV.Cloud.Error('无效的 usageType 参数，必须是 "llm" 或 "tts"。', { code: 400 });
+    }
+
+    // 2. 获取用户角色和对应的权限配置
+    const userRoles = await getUserRoles(user);
+    const permissionQuery = new AV.Query('RolePermission');
+    permissionQuery.containedIn('roleName', userRoles);
+    const permissions = await permissionQuery.find({ useMasterKey: true });
+
+    if (permissions.length === 0) {
+        console.error(`未找到任何与用户角色 ${userRoles.join(', ')} 匹配的权限配置！`);
+        throw new AV.Cloud.Error('服务器权限配置错误，请联系管理员。', { code: 500 });
+    }
+
+    // 3. 计算历史对话轮数限制 (取用户所有角色中最高的那个值)
+    // 如果 historyLimit 字段不存在，则默认为 15
+    const historyLimit = Math.max(...permissions.map(p => p.get('historyLimit') ?? 15));
+
+    // 4. 检查并增加每日调用次数
     try {
-        await checkApiPermission(user, 'tts');
-
-        const endpoint = API_ENDPOINTS['minimax_tts'];
-        const apiKey = MINIMAX_API_KEY;
-
-        if (!endpoint || !apiKey) {
-            console.error(`服务器配置错误: MiniMax TTS 缺少 endpoint 或 apiKey。`);
-            throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
-        }
-
-        const apiResponse = await fetch(endpoint, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`,
-            },
-            body: JSON.stringify(requestBody),
-        });
-
-        const responseJson = await apiResponse.json();
-
-        if (!apiResponse.ok || (responseJson.base_resp && responseJson.base_resp.status_code !== 0)) {
-            const errorMessage = responseJson.base_resp ? responseJson.base_resp.status_msg : `HTTP ${apiResponse.status}`;
-            console.error(`请求 MiniMax TTS 失败: ${errorMessage}`);
-            throw new AV.Cloud.Error(`语音服务商返回错误: ${errorMessage}`, { code: 502 });
-        }
-
-        await user.save(null, { useMasterKey: true });
-        console.log(`用户 ${user.id} 的 ttsCallCount 计数更新成功。`);
-
-        return {
-            audioHex: responseJson.data.audio,
+        await checkAndIncrementUsage(user, usageType, permissions);
+        // 5. 如果检查通过，返回成功以及计算出的历史轮数限制
+        return { 
+            canCall: true, 
+            message: '许可已授予。',
+            historyLimit: historyLimit 
         };
-
     } catch (error) {
-        console.error(`proxyTtsApiCall 内部错误: ${error.message}`);
-        if (error instanceof AV.Cloud.Error) {
-            throw error;
-        }
-        throw new AV.Cloud.Error(error.message || '未知错误', { code: 500 });
+        console.log(`用户 ${user.id} 的 ${usageType} 调用被拒绝: ${error.message}`);
+        // 6. 如果检查不通过，返回失败
+        return { 
+            canCall: false, 
+            message: error.message,
+            historyLimit: 0 // 调用被拒绝时，轮数限制为0
+        };
     }
 });
+// --- ^^^ 核心修改 ^^^ ---
+
 
 // =================================================================
-// == 现有业务云函数 (请将您其他的云函数粘贴到这里)
+// == 现有业务云函数 (无需修改，保持原样)
 // =================================================================
-// ... (此处省略，请将您其他的云函数代码，如 updateUserProfile, followUser 等，完整地复制到这里)
+
+AV.Cloud.define('hello', function(request) {
+  return 'Hello world!';
+});
+
 // --- 用户与个人资料 ---
 AV.Cloud.define('updateUserProfile', async (request) => {
   validateSessionAuth(request);
@@ -1033,4 +947,4 @@ AV.Cloud.afterSave('_User', async (request) => {
   }
 });
 
-// module.exports = AV.Cloud; // <-- 这一行在 cloud.js 中不再需要，因为 app.js 会 require(./cloud)
+module.exports = AV.Cloud;
