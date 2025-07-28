@@ -30,13 +30,13 @@ const API_ENDPOINTS = {
 };
 
 const validateSessionAuth = (request) => {
+  // 对于 Express 请求，req.get() 是正确的方法
   const sessionAuthToken = request.expressReq.get('X-Session-Auth-Token');
   if (!sessionAuthToken) {
     throw new AV.Cloud.Error('无效的客户端，禁止操作。', { code: 403 });
   }
 };
 
-// ... (handshake, isAdmin, etc. remain the same)
 AV.Cloud.define('handshake', async (request) => {
   const { version, timestamp, signature } = request.params;
   if (!version || !timestamp || !signature) {
@@ -53,7 +53,7 @@ AV.Cloud.define('handshake', async (request) => {
       throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
   }
   const challengeData = `${version}|${timestamp}`;
-  const hmac = crypto.createHmac('sha265', rootKey);
+  const hmac = crypto.createHmac('sha256', rootKey);
   hmac.update(challengeData);
   const serverSignature = hmac.digest('hex');
   if (serverSignature !== signature) {
@@ -148,19 +148,15 @@ async function checkApiPermission(user, usageType) {
     return { canCall: true, message: '许可已授予。', historyLimit: historyLimit };
 }
 
-// --- vvv 核心修改：将流式处理逻辑封装成一个独立的 async 函数 vvv ---
-// 这个函数现在是一个标准的 Express 中间件/处理器
 async function streamProxyApiCallHandler(req, res) {
     try {
-        // 注意：这里的 req 和 res 是原始的 Express 对象
-        validateSessionAuth({ expressReq: req }); // 手动调用我们的校验
+        validateSessionAuth({ expressReq: req });
         
-        // 从请求头中获取 session token 来获取当前用户
         const sessionToken = req.headers['x-lc-session'];
         if (!sessionToken) {
-            return res.status(401).send({ error: '用户未登录，禁止操作。' });
+            return res.status(401).json({ code: 401, error: '用户未登录，禁止操作。' });
         }
-        const user = await AV.User.become(sessionToken);
+        const user = await AV.User.become(sessionToken, { useMasterKey: true });
 
         const { apiService, modelName, messages, temperature } = req.body;
 
@@ -219,7 +215,7 @@ async function streamProxyApiCallHandler(req, res) {
         apiResponse.body.on('error', (err) => {
             console.error('代理流传输过程中发生错误:', err);
             if (!res.headersSent) {
-                res.status(500).send({ error: '流传输错误' });
+                res.status(500).json({ code: 500, error: '流传输错误' });
             }
         });
 
@@ -227,19 +223,12 @@ async function streamProxyApiCallHandler(req, res) {
         console.error(`streamProxyApiCallHandler 错误: ${error.message}`);
         if (!res.headersSent) {
             const errorCode = error.code || 500;
-            res.status(errorCode).send(JSON.stringify({ code: errorCode, error: error.message }));
+            res.status(errorCode).json({ code: errorCode, error: error.message });
         }
     }
 }
-// --- ^^^ 核心修改 ^^^ ---
-
-// --- vvv 核心修改：删除旧的 AV.Cloud.define('streamProxyApiCall', ...) vvv ---
-// (此区域留空，确保旧的定义已被删除)
-// --- ^^^ 核心修改 ^^^ ---
-
 
 AV.Cloud.define('proxyTtsApiCall', async (request) => {
-    // ... (此函数保持不变)
     validateSessionAuth(request);
     const user = request.currentUser;
     if (!user) {
@@ -1044,4 +1033,4 @@ AV.Cloud.afterSave('_User', async (request) => {
   }
 });
 
-// module.exports = AV.Cloud; // <-- 注意：当使用 server.js 时，这一行通常不需要
+// module.exports = AV.Cloud; // <-- 这一行在 cloud.js 中不再需要，因为 app.js 会 require(./cloud)
