@@ -1,40 +1,30 @@
-'use strict';
-const AV = require('leanengine');
+'use strict'
+
+const AV = require('leanengine')
 
 AV.init({
   appId: process.env.LEANCLOUD_APP_ID,
   appKey: process.env.LEANCLOUD_APP_KEY,
   masterKey: process.env.LEANCLOUD_APP_MASTER_KEY
-});
+})
 
-// 如果您不希望使用 masterKey，可以注释掉下面这行
-AV.Cloud.useMasterKey();
+// Comment the following line if you do not want to use masterKey.
+AV.Cloud.useMasterKey()
 
-const app = require('./app');
+const app = require('./app')
 
-// --- vvv 核心修改：从 cloud.js 引入我们的自定义处理器 vvv ---
-const { streamProxyApiCallHandler } = require('./cloud');
-// --- ^^^ 核心修改 ^^^ ---
-
-// 从环境变量中获取端口号
-const PORT = parseInt(process.env.LEANCLOUD_APP_PORT || process.env.PORT || 3000);
-
-// --- vvv 核心修改：注册一个完全自定义的、非冲突的路由 vvv ---
-// 这个路径不会被 AV.express() 中间件拦截
-app.post('/api/proxy/stream', streamProxyApiCallHandler);
-// --- ^^^ 核心修改 ^^^ ---
+// Retrieves the port number from environment variable `LEANCLOUD_APP_PORT`.
+// LeanEngine runtime will assign a port and set the environment variable automatically.
+const PORT = parseInt(process.env.LEANCLOUD_APP_PORT || process.env.PORT || 3000)
 
 app.listen(PORT, (err) => {
-  if (err) {
-    return console.error(err);
-  }
-  console.log('Node app is running on port:', PORT);
+  console.log('Node app is running on port:', PORT)
 
-  // 注册全局未捕获异常处理器
+  // Registers a global exception handler for uncaught exceptions.
   process.on('uncaughtException', err => {
-    console.error('Caught exception:', err.stack);
+    console.error('Caught exception:', err.stack)
   });
   process.on('unhandledRejection', (reason, p) => {
-    console.error('Unhandled Rejection at: Promise ', p, ' reason: ', reason.stack);
-  });
-});
+    console.error('Unhandled Rejection at: Promise ', p, ' reason: ', reason.stack)
+  })
+})
