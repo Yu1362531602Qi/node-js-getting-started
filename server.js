@@ -12,17 +12,17 @@ AV.Cloud.useMasterKey();
 
 const app = require('./app');
 
-// --- vvv 核心新增：从 cloud.js 引入我们的自定义处理器 vvv ---
+// --- vvv 核心修改：从 cloud.js 引入我们的自定义处理器 vvv ---
 const { streamProxyApiCallHandler } = require('./cloud');
-// --- ^^^ 核心新增 ^^^ ---
+// --- ^^^ 核心修改 ^^^ ---
 
 // 从环境变量中获取端口号
 const PORT = parseInt(process.env.LEANCLOUD_APP_PORT || process.env.PORT || 3000);
 
-// --- vvv 核心新增：在 app.listen 之前注册我们的自定义路由 vvv ---
-// 这个路由路径必须与客户端 ApiClient 中请求的路径完全一致
-app.post('/1.1/functions/streamProxyApiCall', streamProxyApiCallHandler);
-// --- ^^^ 核心新增 ^^^ ---
+// --- vvv 核心修改：注册一个完全自定义的、非冲突的路由 vvv ---
+// 这个路径不会被 AV.express() 中间件拦截
+app.post('/api/proxy/stream', streamProxyApiCallHandler);
+// --- ^^^ 核心修改 ^^^ ---
 
 app.listen(PORT, (err) => {
   if (err) {
