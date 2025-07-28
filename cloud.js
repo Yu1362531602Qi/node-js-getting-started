@@ -1,4 +1,4 @@
-// cloud.js (V4.1 - Added TTS Proxy)
+// cloud.js (V4.2 - Corrected Stream Function Signature)
 
 'use strict';
 const AV = require('leanengine');
@@ -10,22 +10,20 @@ const fetch = require('node-fetch');
 // == 安全与配置模块
 // =================================================================
 
-// 从环境变量中安全获取密钥
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 const SILICONFLOW_API_KEY = process.env.SILICONFLOW_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY; // <-- 新增
-const MINIMAX_GROUP_ID = process.env.MINIMAX_GROUP_ID; // <-- 新增
+const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY;
+const MINIMAX_GROUP_ID = process.env.MINIMAX_GROUP_ID;
 
-// 第三方 API 地址配置
 const API_ENDPOINTS = {
   deepseek: 'https://api.deepseek.com/chat/completions',
   siliconflow: 'https://api.siliconflow.cn/v1/chat/completions',
   gemini: 'https://api.ssopen.top/v1/chat/completions',
-  minimax_tts: `https://api.minimaxi.com/v1/t2a_v2?GroupId=${MINIMAX_GROUP_ID}`, // <-- 新增
+  minimax_tts: `https://api.minimaxi.com/v1/t2a_v2?GroupId=${MINIMAX_GROUP_ID}`,
 };
 
-// ... (handshake, isAdmin, getUserRoles, validateSessionAuth 等函数保持不变)
+// ... (handshake, isAdmin, etc. remain the same)
 const validateSessionAuth = (request) => {
   const sessionAuthToken = request.expressReq.get('X-Session-Auth-Token');
   if (!sessionAuthToken) {
@@ -100,15 +98,12 @@ const getUserRoles = async (user) => {
     return roleNames;
 };
 
-
 // =================================================================
 // == API 调用代理核心模块
 // =================================================================
 
 async function checkApiPermission(user, usageType) {
-    // ... (此函数保持不变)
     if (await isAdmin(user)) {
-        console.log(`管理员 ${user.get('username')} 请求调用许可，直接通过。`);
         return { canCall: true, message: '管理员权限，许可已授予。', historyLimit: -1 };
     }
 
@@ -118,7 +113,6 @@ async function checkApiPermission(user, usageType) {
     const permissions = await permissionQuery.find({ useMasterKey: true });
 
     if (permissions.length === 0) {
-        console.error(`未找到任何与用户角色 ${userRoles.join(', ')} 匹配的权限配置！`);
         throw new AV.Cloud.Error('服务器权限配置错误，请联系管理员。', { code: 500 });
     }
 
@@ -128,14 +122,12 @@ async function checkApiPermission(user, usageType) {
     const lastCallDate = user.get('lastCallDate');
     const usageCountField = `${usageType}CallCount`;
     let currentUsage = user.get(usageCountField) || 0;
-    let needsReset = false;
 
     if (lastCallDate !== today) {
         user.set('lastCallDate', today);
         user.set('llmCallCount', 0);
         user.set('ttsCallCount', 0);
         currentUsage = 0;
-        needsReset = true;
     }
 
     const limitField = `${usageType}Limit`;
@@ -147,92 +139,100 @@ async function checkApiPermission(user, usageType) {
 
     user.increment(usageCountField, 1);
     
-    return { canCall: true, message: '许可已授予。', historyLimit: historyLimit, needsReset: needsReset };
+    return { canCall: true, message: '许可已授予。', historyLimit: historyLimit };
 }
 
-AV.Cloud.define('streamProxyApiCall', async (request, response) => {
-    // ... (此函数保持不变)
-    validateSessionAuth(request);
-    const user = request.currentUser;
-    if (!user) {
-        response.status(401).send({ error: '用户未登录，禁止操作。' });
-        return;
-    }
-
-    const { apiService, modelName, messages, temperature } = request.params;
-
-    try {
-        const permission = await checkApiPermission(user, 'llm');
-        
-        const endpoint = API_ENDPOINTS[apiService];
-        let apiKey;
-        switch(apiService) {
-            case 'deepseek': apiKey = DEEPSEEK_API_KEY; break;
-            case 'siliconflow': apiKey = SILICONFLOW_API_KEY; break;
-            case 'gemini': apiKey = GEMINI_API_KEY; break;
-            default:
-                throw new AV.Cloud.Error('不支持的 apiService 类型。', { code: 400 });
+// --- vvv 核心修正：移除 async 关键字 vvv ---
+AV.Cloud.define('streamProxyApiCall', (request, response) => {
+// --- ^^^ 核心修正 ^^^ ---
+    // 我们将异步逻辑包裹在一个立即执行的 async 函数中，以继续使用 await
+    (async () => {
+        validateSessionAuth(request);
+        const user = request.currentUser;
+        if (!user) {
+            response.status(401).send({ error: '用户未登录，禁止操作。' });
+            return;
         }
 
-        if (!endpoint || !apiKey) {
-            console.error(`服务器配置错误: apiService "${apiService}" 缺少 endpoint 或 apiKey。`);
-            throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
-        }
+        const { apiService, modelName, messages, temperature } = request.params;
 
-        const truncatedMessages = messages.length > permission.historyLimit && permission.historyLimit !== -1
-            ? [messages[0], ...messages.slice(-(permission.historyLimit * 2))]
-            : messages;
-
-        const body = JSON.stringify({
-            model: modelName,
-            messages: truncatedMessages,
-            temperature: temperature || 1.0,
-            stream: true,
-        });
-
-        const apiResponse = await fetch(endpoint, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`,
-            },
-            body: body,
-        });
-
-        if (!apiResponse.ok) {
-            const errorText = await apiResponse.text();
-            console.error(`请求第三方API失败 (${apiResponse.status}): ${errorText}`);
-            throw new AV.Cloud.Error(`AI服务商返回错误: ${apiResponse.statusText}`, { code: 502 });
-        }
-
-        response.setHeader('Content-Type', 'application/octet-stream');
-        apiResponse.body.pipe(response);
-
-        apiResponse.body.on('end', async () => {
-            try {
-                await user.save(null, { useMasterKey: true });
-                console.log(`用户 ${user.id} 的 llmCallCount 计数更新成功。`);
-            } catch (saveError) {
-                console.error(`为用户 ${user.id} 更新用量计数失败:`, saveError);
+        try {
+            const permission = await checkApiPermission(user, 'llm');
+            
+            const endpoint = API_ENDPOINTS[apiService];
+            let apiKey;
+            switch(apiService) {
+                case 'deepseek': apiKey = DEEPSEEK_API_KEY; break;
+                case 'siliconflow': apiKey = SILICONFLOW_API_KEY; break;
+                case 'gemini': apiKey = GEMINI_API_KEY; break;
+                default:
+                    throw new AV.Cloud.Error('不支持的 apiService 类型。', { code: 400 });
             }
-        });
 
-        apiResponse.body.on('error', (err) => {
-            console.error('代理流传输过程中发生错误:', err);
-            response.status(500).send({ error: '流传输错误' });
-        });
+            if (!endpoint || !apiKey) {
+                console.error(`服务器配置错误: apiService "${apiService}" 缺少 endpoint 或 apiKey。`);
+                throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
+            }
 
-    } catch (error) {
-        console.error(`streamProxyApiCall 内部错误: ${error.message}`);
-        const errorCode = error.code || 500;
-        response.status(errorCode).send(JSON.stringify({ code: errorCode, error: error.message }));
-    }
+            const truncatedMessages = messages.length > permission.historyLimit && permission.historyLimit !== -1
+                ? [messages[0], ...messages.slice(-(permission.historyLimit * 2))]
+                : messages;
+
+            const body = JSON.stringify({
+                model: modelName,
+                messages: truncatedMessages,
+                temperature: temperature || 1.0,
+                stream: true,
+            });
+
+            const apiResponse = await fetch(endpoint, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${apiKey}`,
+                },
+                body: body,
+            });
+
+            if (!apiResponse.ok) {
+                const errorText = await apiResponse.text();
+                console.error(`请求第三方API失败 (${apiResponse.status}): ${errorText}`);
+                throw new AV.Cloud.Error(`AI服务商返回错误: ${apiResponse.statusText}`, { code: 502 });
+            }
+
+            response.setHeader('Content-Type', 'application/octet-stream');
+            apiResponse.body.pipe(response);
+
+            apiResponse.body.on('end', async () => {
+                try {
+                    await user.save(null, { useMasterKey: true });
+                    console.log(`用户 ${user.id} 的 llmCallCount 计数更新成功。`);
+                } catch (saveError) {
+                    console.error(`为用户 ${user.id} 更新用量计数失败:`, saveError);
+                }
+            });
+
+            apiResponse.body.on('error', (err) => {
+                console.error('代理流传输过程中发生错误:', err);
+                if (!response.headersSent) {
+                    response.status(500).send({ error: '流传输错误' });
+                }
+            });
+
+        } catch (error) {
+            console.error(`streamProxyApiCall 内部错误: ${error.message}`);
+            if (!response.headersSent) {
+                const errorCode = error.code || 500;
+                response.status(errorCode).send(JSON.stringify({ code: errorCode, error: error.message }));
+            }
+        }
+    })(); // 立即执行这个 async 函数
 }, {
     stream: true 
 });
 
-// --- vvv 核心新增：TTS 代理云函数 vvv ---
 AV.Cloud.define('proxyTtsApiCall', async (request) => {
+    // ... (此函数保持不变)
     validateSessionAuth(request);
     const user = request.currentUser;
     if (!user) {
@@ -245,10 +245,8 @@ AV.Cloud.define('proxyTtsApiCall', async (request) => {
     }
 
     try {
-        // 1. 内部权限和用量检查
         await checkApiPermission(user, 'tts');
 
-        // 2. 准备并请求 MiniMax API
         const endpoint = API_ENDPOINTS['minimax_tts'];
         const apiKey = MINIMAX_API_KEY;
 
@@ -274,32 +272,26 @@ AV.Cloud.define('proxyTtsApiCall', async (request) => {
             throw new AV.Cloud.Error(`语音服务商返回错误: ${errorMessage}`, { code: 502 });
         }
 
-        // 3. 调用成功，保存用户用量
         await user.save(null, { useMasterKey: true });
         console.log(`用户 ${user.id} 的 ttsCallCount 计数更新成功。`);
 
-        // 4. 返回音频数据
         return {
             audioHex: responseJson.data.audio,
         };
 
     } catch (error) {
         console.error(`proxyTtsApiCall 内部错误: ${error.message}`);
-        // 如果是 AV.Cloud.Error，则直接抛出，否则包装成标准错误
         if (error instanceof AV.Cloud.Error) {
             throw error;
         }
         throw new AV.Cloud.Error(error.message || '未知错误', { code: 500 });
     }
 });
-// --- ^^^ 核心新增 ^^^ ---
-
 
 // =================================================================
-// == 现有业务云函数 (将您其他的云函数粘贴到这里)
+// == 现有业务云函数 (请将您其他的云函数粘贴到这里)
 // =================================================================
 // ... (此处省略，请将您其他的云函数代码，如 updateUserProfile, followUser 等，完整地复制到这里)
-// ... (为了简洁，这里省略了您其他的云函数代码，请将它们复制到这里)
 // --- 用户与个人资料 ---
 AV.Cloud.define('updateUserProfile', async (request) => {
   validateSessionAuth(request);
