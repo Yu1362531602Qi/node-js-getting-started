@@ -1,3 +1,5 @@
+// lib/cloud.js (V3.4.2 - 最终修正版，兼容所有云函数鉴权)
+
 'use strict';
 const AV = require('leanengine');
 const qiniu = require('qiniu');
@@ -8,22 +10,29 @@ const https = require('https');
 // == 安全校验核心模块
 // =================================================================
 
-// --- vvv 核心修正 vvv ---
+// --- vvv 核心最终修正 vvv ---
 const validateSessionAuth = (request) => {
-  // 核心修正：从 request.meta.headers 获取头信息，兼容所有类型的云函数
-  // LeanCloud 会将所有 HTTP Header 的 key 转换为小写
-  const sessionAuthToken = request.meta.headers['x-session-auth-token'];
+  let sessionAuthToken;
   
+  // 智能判断：标准云函数有 expressReq，流式云函数则没有
+  if (request.expressReq) {
+    // 这是标准云函数，从 expressReq 获取 header
+    sessionAuthToken = request.expressReq.get('X-Session-Auth-Token');
+  } else if (request.headers) {
+    // 这是流式云函数，直接从 headers 对象获取（key 已被转为小写）
+    sessionAuthToken = request.headers['x-session-auth-token'];
+  }
+
   if (!sessionAuthToken) {
-    // 增加日志，帮助调试
-    console.error('安全校验失败：请求头中缺少 X-Session-Auth-Token。', { headers: request.meta.headers });
+    console.error('安全校验失败：请求中缺少 X-Session-Auth-Token。');
     throw new AV.Cloud.Error('无效的客户端，禁止操作。', { code: 403 });
   }
   
   const functionName = request.functionName || 'unknown';
   console.log(`Session Auth Token 校验通过，函数: ${functionName}`);
 };
-// --- ^^^ 核心修正 ^^^ ---
+// --- ^^^ 核心最终修正 ^^^ ---
+
 
 AV.Cloud.define('handshake', async (request) => {
   const { version, timestamp, signature } = request.params;
