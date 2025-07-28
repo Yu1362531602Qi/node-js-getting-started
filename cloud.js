@@ -1,4 +1,4 @@
-// lib/cloud.js (V3.4.2 - 最终修正版，兼容所有云函数鉴权)
+// lib/cloud.js (V3.5.0 - 全新架构：分离标准与流式函数鉴权)
 
 'use strict';
 const AV = require('leanengine');
@@ -10,31 +10,46 @@ const https = require('https');
 // == 安全校验核心模块
 // =================================================================
 
-// --- vvv 核心最终修正 vvv ---
-const validateSessionAuth = (request) => {
-  let sessionAuthToken;
-  
-  // 智能判断：标准云函数有 expressReq，流式云函数则没有
-  if (request.expressReq) {
-    // 这是标准云函数，从 expressReq 获取 header
-    sessionAuthToken = request.expressReq.get('X-Session-Auth-Token');
-  } else if (request.headers) {
-    // 这是流式云函数，直接从 headers 对象获取（key 已被转为小写）
-    sessionAuthToken = request.headers['x-session-auth-token'];
-  }
+// --- vvv 核心修改：创建两个独立的验证函数 vvv ---
 
+/**
+ * 用于【标准】云函数的安全校验。
+ * 它依赖 request.expressReq 对象，能正确解析用户会话。
+ */
+const validateSessionAuthForStandardFunc = (request) => {
+  // 从 expressReq 获取 header，这是标准云函数的正确方式
+  const sessionAuthToken = request.expressReq.get('X-Session-Auth-Token');
+  
   if (!sessionAuthToken) {
-    console.error('安全校验失败：请求中缺少 X-Session-Auth-Token。');
+    console.error('【标准函数】安全校验失败：请求头中缺少 X-Session-Auth-Token。');
     throw new AV.Cloud.Error('无效的客户端，禁止操作。', { code: 403 });
   }
   
   const functionName = request.functionName || 'unknown';
-  console.log(`Session Auth Token 校验通过，函数: ${functionName}`);
+  console.log(`【标准函数】'${functionName}' Session Auth Token 校验通过。`);
 };
-// --- ^^^ 核心最终修正 ^^^ ---
+
+/**
+ * 用于【流式】云函数的安全校验。
+ * 它直接从 request.headers 获取，因为流式函数没有 expressReq。
+ */
+const validateSessionAuthForStreamFunc = (request) => {
+    // 从 headers 对象获取（key 已被转为小写）
+    const sessionAuthToken = request.headers['x-session-auth-token'];
+
+    if (!sessionAuthToken) {
+        console.error('【流式函数】安全校验失败：请求头中缺少 X-Session-Auth-Token。');
+        throw new AV.Cloud.Error('无效的客户端，禁止操作。', { code: 403 });
+    }
+    
+    const functionName = request.functionName || 'unknown';
+    console.log(`【流式函数】'${functionName}' Session Auth Token 校验通过。`);
+};
+// --- ^^^ 核心修改 ^^^ ---
 
 
 AV.Cloud.define('handshake', async (request) => {
+  // handshake 是公开接口，不需要 session auth 验证
   const { version, timestamp, signature } = request.params;
   if (!version || !timestamp || !signature) {
     throw new AV.Cloud.Error('无效的握手请求，缺少参数。', { code: 400 });
@@ -151,7 +166,7 @@ async function checkAndIncrementUsage(user, usageType, permissions) {
 }
 
 AV.Cloud.define('requestApiCallPermission', async (request) => {
-    validateSessionAuth(request);
+    validateSessionAuthForStandardFunc(request); // 使用标准函数验证器
     const user = request.currentUser;
     if (!user) {
         throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
@@ -200,18 +215,30 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
     }
 });
 
+// --- vvv 核心修改：proxyLlmStream 函数的鉴权逻辑 vvv ---
 AV.Cloud.define('proxyLlmStream', async (request) => {
-    validateSessionAuth(request);
-    const user = request.currentUser;
-    if (!user) {
-        throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
+    // 1. 对流式函数本身，只做最基础的令牌存在性检查
+    validateSessionAuthForStreamFunc(request);
+    
+    // 2. 获取当前用户信息。注意：对于流式函数，我们需要手动从 sessionToken 构建用户对象
+    const sessionToken = request.headers['x-lc-session'];
+    if (!sessionToken) {
+        throw new AV.Cloud.Error('请求头缺少 X-LC-Session，无法识别用户。', { code: 401 });
     }
-
+    const user = await AV.User.become(sessionToken).catch(() => null);
+    if (!user) {
+        throw new AV.Cloud.Error('无效的 X-LC-Session，用户认证失败。', { code: 401 });
+    }
+    
+    // 3. 【信任链核心】调用标准的、可靠的 requestApiCallPermission 函数进行权限检查和计费
+    // 我们将 user 对象传递给它，让它在正确的用户上下文中运行
     const permissionResult = await AV.Cloud.run('requestApiCallPermission', { usageType: 'llm' }, { user });
     if (!permissionResult.canCall) {
+        // 如果没权限，直接抛出错误，终止执行
         throw new AV.Cloud.Error(permissionResult.message, { code: 429 });
     }
     
+    // 4. 后续代理逻辑保持不变...
     const { serviceProvider, requestBody } = request.params;
     if (!serviceProvider || !requestBody) {
         throw new AV.Cloud.Error('缺少 serviceProvider 或 requestBody 参数。', { code: 400 });
@@ -272,10 +299,11 @@ AV.Cloud.define('proxyLlmStream', async (request) => {
     proxyReq.write(JSON.stringify(requestBody));
     proxyReq.end();
 });
+// --- ^^^ 核心修改 ^^^ ---
 
 
 // =================================================================
-// == 现有业务云函数 (无需修改，保持原样)
+// == 现有业务云函数 (现在统一使用标准函数验证器)
 // =================================================================
 
 AV.Cloud.define('hello', function(request) {
@@ -284,7 +312,7 @@ AV.Cloud.define('hello', function(request) {
 
 // --- 用户与个人资料 ---
 AV.Cloud.define('updateUserProfile', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
@@ -324,7 +352,7 @@ AV.Cloud.define('updateUserProfile', async (request) => {
 });
 
 AV.Cloud.define('getQiniuUserAvatarUploadToken', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   if (!request.currentUser) {
     throw new AV.Cloud.Error('用户未登录，禁止获取上传凭证。', { code: 401 });
   }
@@ -352,7 +380,7 @@ AV.Cloud.define('getQiniuUserAvatarUploadToken', async (request) => {
 });
 
 AV.Cloud.define('saveUserAvatarUrl', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const currentUser = request.currentUser;
   if (!currentUser) {
     throw new AV.Cloud.Error('用户未登录，无法更新头像。', { code: 401 });
@@ -410,7 +438,7 @@ AV.Cloud.define('saveUserAvatarUrl', async (request) => {
 
 // --- 关注/粉丝相关云函数 ---
 AV.Cloud.define('followUser', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
@@ -422,7 +450,7 @@ AV.Cloud.define('followUser', async (request) => {
   if (user.id === targetUserId) {
     throw new AV.Cloud.Error('不能关注自己。', { code: 400 });
   }
-  const followQuery = new AV.Query('UserFollow'); // 核心修改
+  const followQuery = new AV.Query('UserFollow');
   followQuery.equalTo('user', user);
   followQuery.equalTo('followed', AV.Object.createWithoutData('_User', targetUserId));
   const existingFollow = await followQuery.first();
@@ -430,7 +458,7 @@ AV.Cloud.define('followUser', async (request) => {
     console.log(`用户 ${user.id} 已关注 ${targetUserId}，无需重复操作。`);
     return { success: true, message: '已关注' };
   }
-  const Follow = AV.Object.extend('UserFollow'); // 核心修改
+  const Follow = AV.Object.extend('UserFollow');
   const newFollow = new Follow();
   newFollow.set('user', user);
   newFollow.set('followed', AV.Object.createWithoutData('_User', targetUserId));
@@ -447,7 +475,7 @@ AV.Cloud.define('followUser', async (request) => {
 });
 
 AV.Cloud.define('unfollowUser', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
@@ -456,7 +484,7 @@ AV.Cloud.define('unfollowUser', async (request) => {
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
   }
-  const followQuery = new AV.Query('UserFollow'); // 核心修改
+  const followQuery = new AV.Query('UserFollow');
   followQuery.equalTo('user', user);
   followQuery.equalTo('followed', AV.Object.createWithoutData('_User', targetUserId));
   const followRecord = await followQuery.first();
@@ -473,13 +501,13 @@ AV.Cloud.define('unfollowUser', async (request) => {
 });
 
 AV.Cloud.define('getFollowers', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const { targetUserId, page = 1, limit = 20 } = request.params;
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
   }
   const targetUser = AV.Object.createWithoutData('_User', targetUserId);
-  const query = new AV.Query('UserFollow'); // 核心修改
+  const query = new AV.Query('UserFollow');
   query.equalTo('followed', targetUser);
   query.include('user');
   query.select('user.username', 'user.avatarUrl', 'user.objectId');
@@ -491,13 +519,13 @@ AV.Cloud.define('getFollowers', async (request) => {
 });
 
 AV.Cloud.define('getFollowing', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const { targetUserId, page = 1, limit = 20 } = request.params;
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
   }
   const targetUser = AV.Object.createWithoutData('_User', targetUserId);
-  const query = new AV.Query('UserFollow'); // 核心修改
+  const query = new AV.Query('UserFollow');
   query.equalTo('user', targetUser);
   query.include('followed');
   query.select('followed.username', 'followed.avatarUrl', 'followed.objectId');
@@ -510,7 +538,7 @@ AV.Cloud.define('getFollowing', async (request) => {
 
 // --- 角色与创作管理 ---
 AV.Cloud.define('generateNewLocalCharacterId', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，无法生成ID。', { code: 401 });
@@ -524,7 +552,7 @@ AV.Cloud.define('generateNewLocalCharacterId', async (request) => {
 });
 
 AV.Cloud.define('toggleLikeCharacter', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
@@ -571,7 +599,7 @@ AV.Cloud.define('toggleLikeCharacter', async (request) => {
 });
 
 AV.Cloud.define('incrementChatCount', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   if (!request.currentUser) {
     console.log("未登录用户尝试增加聊天计数，已忽略。");
     return { success: true, message: "Ignored for anonymous user." };
@@ -594,7 +622,7 @@ AV.Cloud.define('incrementChatCount', async (request) => {
 });
 
 AV.Cloud.define('getQiniuUploadToken', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const accessKey = process.env.QINIU_AK;
   const secretKey = process.env.QINIU_SK;
   const bucket = process.env.QINIU_BUCKET_NAME;
@@ -620,7 +648,7 @@ AV.Cloud.define('getQiniuUploadToken', async (request) => {
 });
 
 AV.Cloud.define('getSubmissionStatuses', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const user = request.currentUser;
   if (!user) {
     throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
@@ -644,7 +672,7 @@ AV.Cloud.define('getSubmissionStatuses', async (request) => {
 
 // --- 搜索功能 ---
 AV.Cloud.define('searchPublicContent', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const { searchText } = request.params;
   if (!searchText || searchText.trim().length < 1) {
     return { characters: [], users: [] };
@@ -681,7 +709,7 @@ AV.Cloud.define('searchPublicContent', async (request) => {
 
 // --- 用户主页 ---
 AV.Cloud.define('getUserPublicProfile', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const { userId } = request.params;
   const currentUser = request.currentUser;
   if (!userId) {
@@ -724,7 +752,7 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
   };
   let isFollowing = false;
   if (currentUser && currentUser.id !== userId) {
-    const followQuery = new AV.Query('UserFollow'); // 核心修改
+    const followQuery = new AV.Query('UserFollow');
     followQuery.equalTo('user', currentUser);
     followQuery.equalTo('followed', user);
     const followRecord = await followQuery.first();
@@ -740,7 +768,7 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
 });
 
 AV.Cloud.define('getUserCreations', async (request) => {
-  validateSessionAuth(request);
+  validateSessionAuthForStandardFunc(request);
   const { targetUserId, page = 1, limit = 20 } = request.params;
   if (!targetUserId) {
     throw new AV.Cloud.Error('必须提供 targetUserId 参数。', { code: 400 });
