@@ -1,10 +1,10 @@
-// cloud.js (V4.0 - Server-Side API Proxy)
+// cloud.js (V4.1 - Added TTS Proxy)
 
 'use strict';
 const AV = require('leanengine');
 const qiniu = require('qiniu');
 const crypto = require('crypto');
-const fetch = require('node-fetch'); // 引入 node-fetch 用于流式请求
+const fetch = require('node-fetch');
 
 // =================================================================
 // == 安全与配置模块
@@ -14,14 +14,18 @@ const fetch = require('node-fetch'); // 引入 node-fetch 用于流式请求
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 const SILICONFLOW_API_KEY = process.env.SILICONFLOW_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY; // <-- 新增
+const MINIMAX_GROUP_ID = process.env.MINIMAX_GROUP_ID; // <-- 新增
 
 // 第三方 API 地址配置
 const API_ENDPOINTS = {
   deepseek: 'https://api.deepseek.com/chat/completions',
   siliconflow: 'https://api.siliconflow.cn/v1/chat/completions',
   gemini: 'https://api.ssopen.top/v1/chat/completions',
+  minimax_tts: `https://api.minimaxi.com/v1/t2a_v2?GroupId=${MINIMAX_GROUP_ID}`, // <-- 新增
 };
 
+// ... (handshake, isAdmin, getUserRoles, validateSessionAuth 等函数保持不变)
 const validateSessionAuth = (request) => {
   const sessionAuthToken = request.expressReq.get('X-Session-Auth-Token');
   if (!sessionAuthToken) {
@@ -96,17 +100,13 @@ const getUserRoles = async (user) => {
     return roleNames;
 };
 
+
 // =================================================================
-// == API 调用代理核心模块 (V4.0 新增)
+// == API 调用代理核心模块
 // =================================================================
 
-/**
- * 内部辅助函数：检查API调用许可和用量
- * @param {AV.User} user - 当前用户对象
- * @param {string} usageType - 'llm' 或 'tts'
- * @returns {Promise<{canCall: boolean, message: string, historyLimit: number}>}
- */
 async function checkApiPermission(user, usageType) {
+    // ... (此函数保持不变)
     if (await isAdmin(user)) {
         console.log(`管理员 ${user.get('username')} 请求调用许可，直接通过。`);
         return { canCall: true, message: '管理员权限，许可已授予。', historyLimit: -1 };
@@ -124,17 +124,18 @@ async function checkApiPermission(user, usageType) {
 
     const historyLimit = Math.max(...permissions.map(p => p.get('historyLimit') ?? 15));
     
-    // 检查并增加每日调用次数
     const today = new Date().toISOString().slice(0, 10);
     const lastCallDate = user.get('lastCallDate');
     const usageCountField = `${usageType}CallCount`;
     let currentUsage = user.get(usageCountField) || 0;
+    let needsReset = false;
 
     if (lastCallDate !== today) {
         user.set('lastCallDate', today);
         user.set('llmCallCount', 0);
         user.set('ttsCallCount', 0);
         currentUsage = 0;
+        needsReset = true;
     }
 
     const limitField = `${usageType}Limit`;
@@ -145,18 +146,12 @@ async function checkApiPermission(user, usageType) {
     }
 
     user.increment(usageCountField, 1);
-    // 注意：这里我们先不保存，等待API调用成功后再保存，防止网络失败也扣费
     
-    return { canCall: true, message: '许可已授予。', historyLimit: historyLimit };
+    return { canCall: true, message: '许可已授予。', historyLimit: historyLimit, needsReset: needsReset };
 }
 
-
-/**
- * 新的统一流式API代理云函数
- * @param {object} request - LeanCloud 请求对象
- * @param {object} response - LeanCloud 响应对象，用于流式返回
- */
 AV.Cloud.define('streamProxyApiCall', async (request, response) => {
+    // ... (此函数保持不变)
     validateSessionAuth(request);
     const user = request.currentUser;
     if (!user) {
@@ -167,10 +162,8 @@ AV.Cloud.define('streamProxyApiCall', async (request, response) => {
     const { apiService, modelName, messages, temperature } = request.params;
 
     try {
-        // 1. 内部权限和用量检查
         const permission = await checkApiPermission(user, 'llm');
         
-        // 2. 准备第三方API请求
         const endpoint = API_ENDPOINTS[apiService];
         let apiKey;
         switch(apiService) {
@@ -186,9 +179,8 @@ AV.Cloud.define('streamProxyApiCall', async (request, response) => {
             throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
         }
 
-        // 截断历史记录
         const truncatedMessages = messages.length > permission.historyLimit && permission.historyLimit !== -1
-            ? [messages[0], ...messages.slice(-(permission.historyLimit * 2))] // 简单截断，保留system prompt和最近的对话
+            ? [messages[0], ...messages.slice(-(permission.historyLimit * 2))]
             : messages;
 
         const body = JSON.stringify({
@@ -198,7 +190,6 @@ AV.Cloud.define('streamProxyApiCall', async (request, response) => {
             stream: true,
         });
 
-        // 3. 发起流式请求到第三方API
         const apiResponse = await fetch(endpoint, {
             method: 'POST',
             headers: {
@@ -214,11 +205,9 @@ AV.Cloud.define('streamProxyApiCall', async (request, response) => {
             throw new AV.Cloud.Error(`AI服务商返回错误: ${apiResponse.statusText}`, { code: 502 });
         }
 
-        // 4. 将第三方API的流式响应管道传输回客户端
         response.setHeader('Content-Type', 'application/octet-stream');
         apiResponse.body.pipe(response);
 
-        // 5. 监听流结束事件，以确认调用成功并保存用户用量
         apiResponse.body.on('end', async () => {
             try {
                 await user.save(null, { useMasterKey: true });
@@ -236,20 +225,80 @@ AV.Cloud.define('streamProxyApiCall', async (request, response) => {
     } catch (error) {
         console.error(`streamProxyApiCall 内部错误: ${error.message}`);
         const errorCode = error.code || 500;
-        // 向客户端发送一个标准的错误JSON
         response.status(errorCode).send(JSON.stringify({ code: errorCode, error: error.message }));
     }
 }, {
-    // 关键：声明这是一个流式函数
     stream: true 
 });
 
+// --- vvv 核心新增：TTS 代理云函数 vvv ---
+AV.Cloud.define('proxyTtsApiCall', async (request) => {
+    validateSessionAuth(request);
+    const user = request.currentUser;
+    if (!user) {
+        throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
+    }
+
+    const { requestBody } = request.params;
+    if (!requestBody || !requestBody.text) {
+        throw new AV.Cloud.Error('无效的请求体。', { code: 400 });
+    }
+
+    try {
+        // 1. 内部权限和用量检查
+        await checkApiPermission(user, 'tts');
+
+        // 2. 准备并请求 MiniMax API
+        const endpoint = API_ENDPOINTS['minimax_tts'];
+        const apiKey = MINIMAX_API_KEY;
+
+        if (!endpoint || !apiKey) {
+            console.error(`服务器配置错误: MiniMax TTS 缺少 endpoint 或 apiKey。`);
+            throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
+        }
+
+        const apiResponse = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify(requestBody),
+        });
+
+        const responseJson = await apiResponse.json();
+
+        if (!apiResponse.ok || (responseJson.base_resp && responseJson.base_resp.status_code !== 0)) {
+            const errorMessage = responseJson.base_resp ? responseJson.base_resp.status_msg : `HTTP ${apiResponse.status}`;
+            console.error(`请求 MiniMax TTS 失败: ${errorMessage}`);
+            throw new AV.Cloud.Error(`语音服务商返回错误: ${errorMessage}`, { code: 502 });
+        }
+
+        // 3. 调用成功，保存用户用量
+        await user.save(null, { useMasterKey: true });
+        console.log(`用户 ${user.id} 的 ttsCallCount 计数更新成功。`);
+
+        // 4. 返回音频数据
+        return {
+            audioHex: responseJson.data.audio,
+        };
+
+    } catch (error) {
+        console.error(`proxyTtsApiCall 内部错误: ${error.message}`);
+        // 如果是 AV.Cloud.Error，则直接抛出，否则包装成标准错误
+        if (error instanceof AV.Cloud.Error) {
+            throw error;
+        }
+        throw new AV.Cloud.Error(error.message || '未知错误', { code: 500 });
+    }
+});
+// --- ^^^ 核心新增 ^^^ ---
+
 
 // =================================================================
-// == 现有业务云函数 (大部分无需修改)
+// == 现有业务云函数 (将您其他的云函数粘贴到这里)
 // =================================================================
-
-// ... (您其他的云函数如 hello, updateUserProfile, followUser 等保持不变)
+// ... (此处省略，请将您其他的云函数代码，如 updateUserProfile, followUser 等，完整地复制到这里)
 // ... (为了简洁，这里省略了您其他的云函数代码，请将它们复制到这里)
 // --- 用户与个人资料 ---
 AV.Cloud.define('updateUserProfile', async (request) => {
