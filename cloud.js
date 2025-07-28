@@ -1,4 +1,4 @@
-// cloud.js (V3.6 - 全功能头衔系统)
+// cloud.js (V3.7 - 终极头衔系统修复版)
 
 'use strict';
 const AV = require('leanengine');
@@ -89,7 +89,7 @@ const getUserRoles = async (user) => {
     return roleNames;
 };
 
-// --- vvv 核心新增：头衔系统核心辅助函数 vvv ---
+// --- 头衔系统核心辅助函数 ---
 /**
  * 根据用户的角色，获取其最高优先级的头衔。
  * @param {AV.User} user - LeanCloud 用户对象。
@@ -125,7 +125,18 @@ const getHighestPriorityTitle = async (user) => {
 
     return null; // 没有找到任何有效头衔
 };
-// --- ^^^ 核心新增 ^^^ ---
+
+// --- 专门用于获取当前用户头衔的云函数 ---
+AV.Cloud.define('getCurrentUserTitle', async (request) => {
+    validateSessionAuth(request);
+    const user = request.currentUser;
+    if (!user) {
+        // 即使用户不存在，也返回一个可解析的 null 结果，而不是抛出错误
+        return { title: null };
+    }
+    const title = await getHighestPriorityTitle(user);
+    return { title: title };
+});
 
 
 // =================================================================
@@ -624,14 +635,11 @@ AV.Cloud.define('searchPublicContent', async (request) => {
       characterQuery.find(),
       userQuery.find()
     ]);
-
-    // 为搜索到的用户并行查询并附加头衔
     const usersWithTitles = await Promise.all(userResults.map(async (user) => {
         const userJSON = user.toJSON();
         userJSON.equippedTitle = await getHighestPriorityTitle(user);
         return userJSON;
     }));
-
     return {
       characters: characterResults,
       users: usersWithTitles,
@@ -656,14 +664,11 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
   if (!user) {
     throw new AV.Cloud.Error('用户不存在。', { code: 404 });
   }
-
-  // 获取用户数据后，调用新函数计算头衔
   const equippedTitle = await getHighestPriorityTitle(user);
   const userJSON = user.toJSON();
   if (equippedTitle) {
       userJSON.equippedTitle = equippedTitle;
   }
-
   const creationsCountQuery = new AV.Query('Character');
   creationsCountQuery.equalTo('author', AV.Object.createWithoutData('_User', userId));
   const creationsCount = await creationsCountQuery.count({ useMasterKey: true });
