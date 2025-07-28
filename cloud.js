@@ -1,5 +1,3 @@
-// lib/cloud.js (V5.1.0 - 最终架构：补全 Ticket 函数)
-
 'use strict';
 const AV = require('leanengine');
 const qiniu = require('qiniu');
@@ -20,7 +18,7 @@ const validateSessionAuthForStandardFunc = (request) => {
 };
 
 // =================================================================
-// == 辅助函数 (保持不变)
+// == 辅助函数
 // =================================================================
 const isAdmin = async (user) => {
   if (!user) return false;
@@ -132,29 +130,25 @@ AV.Cloud.define('handshake', async (request) => {
   };
 });
 
-// --- vvv 核心新增：获取调用票据的【标准】云函数 vvv ---
+// --- vvv 这是必须存在的【标准】云函数，用于获取调用票据 vvv ---
 AV.Cloud.define('getLlmInvocationTicket', async (request) => {
-    // 1. 使用标准、可靠的验证器
     validateSessionAuthForStandardFunc(request);
     const user = request.currentUser;
     if (!user) {
         throw new AV.Cloud.Error('用户未登录。', { code: 401 });
     }
 
-    // 2. 调用内部的权限检查和计费函数
     const permissionResult = await AV.Cloud.run('requestApiCallPermission', { usageType: 'llm' }, { user });
     if (!permissionResult.canCall) {
         throw new AV.Cloud.Error(permissionResult.message, { code: 429 });
     }
 
-    // 3. 生成一个一次性的 Ticket
     const ticket = crypto.randomBytes(16).toString('hex');
     const InvocationTicket = AV.Object.extend('InvocationTicket');
     const newTicket = new InvocationTicket();
     newTicket.set('ticket', ticket);
     newTicket.set('user', user);
     
-    // 4. 设置 Ticket 的有效期为 30 秒
     const acl = new AV.ACL();
     acl.setPublicReadAccess(false);
     acl.setPublicWriteAccess(false);
@@ -165,25 +159,22 @@ AV.Cloud.define('getLlmInvocationTicket', async (request) => {
 
     console.log(`为用户 ${user.id} 生成了 LLM 调用票据: ${ticket}`);
     
-    // 5. 将 Ticket 和历史限制一并返回给客户端
     return { 
         ticket: ticket,
         historyLimit: permissionResult.historyLimit 
     };
 });
 
-// --- vvv 核心修改：简化 proxyLlmStream 函数 vvv ---
+// --- 这是【流式】云函数，用于代理请求 ---
 AV.Cloud.define('proxyLlmStream', async (request) => {
-    // 1. 不再进行复杂的 header 验证
     const { invocationTicket, serviceProvider, requestBody } = request.params;
     if (!invocationTicket || !serviceProvider || !requestBody) {
         throw new AV.Cloud.Error('缺少 invocationTicket, serviceProvider 或 requestBody 参数。', { code: 400 });
     }
 
-    // 2. 验证 Ticket 的有效性
     const ticketQuery = new AV.Query('InvocationTicket');
     ticketQuery.equalTo('ticket', invocationTicket);
-    ticketQuery.greaterThan('expiresAt', new Date()); // 检查是否过期
+    ticketQuery.greaterThan('expiresAt', new Date());
     
     const ticketObject = await ticketQuery.first({ useMasterKey: true });
 
@@ -191,11 +182,9 @@ AV.Cloud.define('proxyLlmStream', async (request) => {
         throw new AV.Cloud.Error('无效或已过期的调用票据。', { code: 403 });
     }
 
-    // 3. 【重要】立即销毁 Ticket，确保它只能被使用一次
     await ticketObject.destroy({ useMasterKey: true });
     console.log(`票据 ${invocationTicket} 已验证并销毁。`);
 
-    // 4. 后续代理逻辑保持不变...
     let targetUrl, apiKey, hostname, path;
     const headers = { 'Content-Type': 'application/json' };
 
@@ -290,7 +279,7 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
 
 
 // =================================================================
-// == 所有其他【标准】云函数，统一使用 validateSessionAuthForStandardFunc
+// == 所有其他【标准】云函数
 // =================================================================
 AV.Cloud.define('updateUserProfile', async (request) => {
   validateSessionAuthForStandardFunc(request);
