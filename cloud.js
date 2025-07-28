@@ -1,4 +1,4 @@
-// cloud.js (V4.2 - Corrected Stream Function Signature)
+// cloud.js (V4.3 - Final Stream Function Fix)
 
 'use strict';
 const AV = require('leanengine');
@@ -142,94 +142,101 @@ async function checkApiPermission(user, usageType) {
     return { canCall: true, message: '许可已授予。', historyLimit: historyLimit };
 }
 
-// --- vvv 核心修正：移除 async 关键字 vvv ---
+// --- vvv 核心修正：使用 Promise.then().catch() 链式调用来重写流函数 vvv ---
 AV.Cloud.define('streamProxyApiCall', (request, response) => {
-// --- ^^^ 核心修正 ^^^ ---
-    // 我们将异步逻辑包裹在一个立即执行的 async 函数中，以继续使用 await
-    (async () => {
+    try {
         validateSessionAuth(request);
         const user = request.currentUser;
         if (!user) {
-            response.status(401).send({ error: '用户未登录，禁止操作。' });
-            return;
+            return response.status(401).send({ error: '用户未登录，禁止操作。' });
         }
 
         const { apiService, modelName, messages, temperature } = request.params;
 
-        try {
-            const permission = await checkApiPermission(user, 'llm');
-            
-            const endpoint = API_ENDPOINTS[apiService];
-            let apiKey;
-            switch(apiService) {
-                case 'deepseek': apiKey = DEEPSEEK_API_KEY; break;
-                case 'siliconflow': apiKey = SILICONFLOW_API_KEY; break;
-                case 'gemini': apiKey = GEMINI_API_KEY; break;
-                default:
-                    throw new AV.Cloud.Error('不支持的 apiService 类型。', { code: 400 });
-            }
-
-            if (!endpoint || !apiKey) {
-                console.error(`服务器配置错误: apiService "${apiService}" 缺少 endpoint 或 apiKey。`);
-                throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
-            }
-
-            const truncatedMessages = messages.length > permission.historyLimit && permission.historyLimit !== -1
-                ? [messages[0], ...messages.slice(-(permission.historyLimit * 2))]
-                : messages;
-
-            const body = JSON.stringify({
-                model: modelName,
-                messages: truncatedMessages,
-                temperature: temperature || 1.0,
-                stream: true,
-            });
-
-            const apiResponse = await fetch(endpoint, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${apiKey}`,
-                },
-                body: body,
-            });
-
-            if (!apiResponse.ok) {
-                const errorText = await apiResponse.text();
-                console.error(`请求第三方API失败 (${apiResponse.status}): ${errorText}`);
-                throw new AV.Cloud.Error(`AI服务商返回错误: ${apiResponse.statusText}`, { code: 502 });
-            }
-
-            response.setHeader('Content-Type', 'application/octet-stream');
-            apiResponse.body.pipe(response);
-
-            apiResponse.body.on('end', async () => {
-                try {
-                    await user.save(null, { useMasterKey: true });
-                    console.log(`用户 ${user.id} 的 llmCallCount 计数更新成功。`);
-                } catch (saveError) {
-                    console.error(`为用户 ${user.id} 更新用量计数失败:`, saveError);
+        // 使用 Promise 链来处理异步操作
+        checkApiPermission(user, 'llm')
+            .then(permission => {
+                const endpoint = API_ENDPOINTS[apiService];
+                let apiKey;
+                switch(apiService) {
+                    case 'deepseek': apiKey = DEEPSEEK_API_KEY; break;
+                    case 'siliconflow': apiKey = SILICONFLOW_API_KEY; break;
+                    case 'gemini': apiKey = GEMINI_API_KEY; break;
+                    default:
+                        throw new AV.Cloud.Error('不支持的 apiService 类型。', { code: 400 });
                 }
-            });
 
-            apiResponse.body.on('error', (err) => {
-                console.error('代理流传输过程中发生错误:', err);
+                if (!endpoint || !apiKey) {
+                    console.error(`服务器配置错误: apiService "${apiService}" 缺少 endpoint 或 apiKey。`);
+                    throw new AV.Cloud.Error('服务器内部配置错误。', { code: 500 });
+                }
+
+                const truncatedMessages = messages.length > permission.historyLimit && permission.historyLimit !== -1
+                    ? [messages[0], ...messages.slice(-(permission.historyLimit * 2))]
+                    : messages;
+
+                const body = JSON.stringify({
+                    model: modelName,
+                    messages: truncatedMessages,
+                    temperature: temperature || 1.0,
+                    stream: true,
+                });
+
+                return fetch(endpoint, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${apiKey}`,
+                    },
+                    body: body,
+                });
+            })
+            .then(apiResponse => {
+                if (!apiResponse.ok) {
+                    // 如果 fetch 响应不 ok，读取错误体并抛出
+                    return apiResponse.text().then(errorText => {
+                        console.error(`请求第三方API失败 (${apiResponse.status}): ${errorText}`);
+                        throw new AV.Cloud.Error(`AI服务商返回错误: ${apiResponse.statusText}`, { code: 502 });
+                    });
+                }
+
+                response.setHeader('Content-Type', 'application/octet-stream');
+                apiResponse.body.pipe(response);
+
+                apiResponse.body.on('end', () => {
+                    user.save(null, { useMasterKey: true })
+                        .then(() => console.log(`用户 ${user.id} 的 llmCallCount 计数更新成功。`))
+                        .catch(saveError => console.error(`为用户 ${user.id} 更新用量计数失败:`, saveError));
+                });
+
+                apiResponse.body.on('error', (err) => {
+                    console.error('代理流传输过程中发生错误:', err);
+                    if (!response.headersSent) {
+                        response.status(500).send({ error: '流传输错误' });
+                    }
+                });
+            })
+            .catch(error => {
+                // 统一捕获链中所有的错误
+                console.error(`streamProxyApiCall 内部错误: ${error.message}`);
                 if (!response.headersSent) {
-                    response.status(500).send({ error: '流传输错误' });
+                    const errorCode = error.code || 500;
+                    response.status(errorCode).send(JSON.stringify({ code: errorCode, error: error.message }));
                 }
             });
 
-        } catch (error) {
-            console.error(`streamProxyApiCall 内部错误: ${error.message}`);
-            if (!response.headersSent) {
-                const errorCode = error.code || 500;
-                response.status(errorCode).send(JSON.stringify({ code: errorCode, error: error.message }));
-            }
+    } catch (error) {
+        // 捕获同步错误，例如 validateSessionAuth 抛出的错误
+        console.error(`streamProxyApiCall 同步错误: ${error.message}`);
+        if (!response.headersSent) {
+            const errorCode = error.code || 500;
+            response.status(errorCode).send(JSON.stringify({ code: errorCode, error: error.message }));
         }
-    })(); // 立即执行这个 async 函数
+    }
 }, {
     stream: true 
 });
+// --- ^^^ 核心修正 ^^^ ---
 
 AV.Cloud.define('proxyTtsApiCall', async (request) => {
     // ... (此函数保持不变)
