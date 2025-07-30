@@ -1,9 +1,10 @@
-// cloud.js (V3.6 - 最终优化版)
+// cloud.js (V3.7 - 最终生产版)
 // 变更日志:
 // - 彻底移除不可靠的 afterSave Hook。
 // - 强化 getUserRoles 函数，使其能主动为所有用户保障基础 "User" 角色，不再依赖 Hook。
 // - 移除低效的 isAdmin 函数，所有权限检查统一通过 getUserRoles 高效完成。
 // - 修复了因 isAdmin 查询导致的数据库超时性能瓶颈。
+// - 新增 test_addUserToRole 云函数，用于测试和演示如何可靠地向数据库中为用户添加角色。
 
 'use strict';
 const AV = require('leanengine');
@@ -11,7 +12,7 @@ const qiniu = require('qiniu');
 const crypto = require('crypto');
 
 // =================================================================
-// == 安全校验与角色管理核心模块 (已优化)
+// == 安全校验与角色管理核心模块
 // =================================================================
 
 const validateSessionAuth = (request) => {
@@ -205,6 +206,47 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
 
 AV.Cloud.define('hello', function(request) {
   return 'Hello world!';
+});
+
+/**
+ * [仅供测试] 将指定用户添加到一个指定的角色中。
+ * 需要管理员权限才能调用。
+ * @param {string} targetUserId - 需要被添加角色的用户 objectId
+ * @param {string} roleName - 目标角色的名称 (例如 "Sponsor", "Admin")
+ */
+AV.Cloud.define('test_addUserToRole', async (request) => {
+  const userRoles = await getUserRoles(request);
+  if (!userRoles.includes('Admin')) {
+    throw new AV.Cloud.Error('权限不足，仅限管理员操作。', { code: 403 });
+  }
+
+  const { targetUserId, roleName } = request.params;
+  if (!targetUserId || !roleName) {
+    throw new AV.Cloud.Error('参数缺失，需要提供 targetUserId 和 roleName。', { code: 400 });
+  }
+
+  try {
+    const roleQuery = new AV.Query(AV.Role);
+    roleQuery.equalTo('name', roleName);
+    const targetRole = await roleQuery.first({ useMasterKey: true });
+
+    if (!targetRole) {
+      throw new AV.Cloud.Error(`名为 "${roleName}" 的角色不存在，请先在 _Role 表中创建。`, { code: 404 });
+    }
+
+    const userToAdd = AV.Object.createWithoutData('_User', targetUserId);
+    const relation = targetRole.relation('users');
+    relation.add(userToAdd);
+    await targetRole.save(null, { useMasterKey: true });
+
+    const successMessage = `成功！已将用户 ${targetUserId} 添加到角色 "${roleName}" 中。`;
+    console.log(successMessage);
+    return { success: true, message: successMessage };
+
+  } catch (error) {
+    console.error(`[test_addUserToRole] 操作失败:`, error);
+    throw new AV.Cloud.Error(error.message, { code: error.code || 500 });
+  }
 });
 
 // --- 用户与个人资料 ---
@@ -685,6 +727,10 @@ AV.Cloud.define('getUserCreations', async (request) => {
 // =================================================================
 
 AV.Cloud.define('publishApprovedCharacters', async (request) => {
+  const userRoles = await getUserRoles(request);
+  if (!userRoles.includes('Admin')) {
+    throw new AV.Cloud.Error('权限不足，仅限管理员操作。', { code: 403 });
+  }
   const submissionQuery = new AV.Query('CharacterSubmissions');
   submissionQuery.equalTo('status', 'approved');
   submissionQuery.include('submitter');
@@ -912,14 +958,5 @@ AV.Cloud.define('migrateAllCharactersToOwner', async (request) => {
   console.log(resultMessage);
   return resultMessage;
 });
-
-// =================================================================
-// == Cloud Hook (已移除)
-// =================================================================
-//
-// 原有的 afterSave Hook 已被移除。
-// 因为免费版实例休眠会导致 Hook 不可靠，我们已将保障用户基础角色的逻辑
-// 移至 getUserRoles 函数中，使其更加健壮和可靠。
-//
 
 module.exports = AV.Cloud;
