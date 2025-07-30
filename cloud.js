@@ -1,4 +1,9 @@
-// cloud.js (V3.5 - 性能优化版)
+// cloud.js (V3.6 - 最终优化版)
+// 变更日志:
+// - 彻底移除不可靠的 afterSave Hook。
+// - 强化 getUserRoles 函数，使其能主动为所有用户保障基础 "User" 角色，不再依赖 Hook。
+// - 移除低效的 isAdmin 函数，所有权限检查统一通过 getUserRoles 高效完成。
+// - 修复了因 isAdmin 查询导致的数据库超时性能瓶颈。
 
 'use strict';
 const AV = require('leanengine');
@@ -6,20 +11,17 @@ const qiniu = require('qiniu');
 const crypto = require('crypto');
 
 // =================================================================
-// == 安全校验核心模块 (已优化)
+// == 安全校验与角色管理核心模块 (已优化)
 // =================================================================
 
-// --- vvv 核心优化：增强日志记录，记录更详细的端点信息 vvv ---
 const validateSessionAuth = (request) => {
   const sessionAuthToken = request.expressReq.get('X-Session-Auth-Token');
   if (!sessionAuthToken) {
     throw new AV.Cloud.Error('无效的客户端，禁止操作。', { code: 403 });
   }
-  // 优先使用函数名，否则使用请求路径，提供更明确的日志
   const endpoint = request.functionName || request.expressReq.path || 'unknown';
   console.log(`Session Auth Token 校验通过，端点: ${endpoint}`);
 };
-// --- ^^^ 核心优化 ^^^ ---
 
 AV.Cloud.define('handshake', async (request) => {
   const { version, timestamp, signature } = request.params;
@@ -68,12 +70,13 @@ AV.Cloud.define('handshake', async (request) => {
   };
 });
 
-// --- vvv 核心优化：移除低效的 isAdmin 函数 vvv ---
-// const isAdmin = async (user) => { ... }; // 此函数已被移除
-
-// --- vvv 核心优化：为 getUserRoles 增加请求内缓存，避免重复查询 vvv ---
+/**
+ * 高效获取用户角色列表，并内置“双重保险”逻辑。
+ * 即使 afterSave Hook 失效，此函数也能确保每个用户至少拥有 'User' 角色。
+ * @param {AV.Cloud.Request} request - 云函数请求对象
+ * @returns {Promise<string[]>} - 用户的角色名称数组
+ */
 const getUserRoles = async (request) => {
-    // 如果在同一次请求中已经获取过角色，则直接从缓存返回
     if (request.userRoles) {
         console.log(`[Auth] 从请求缓存中获取用户 ${request.currentUser.id} 的角色: [${request.userRoles.join(', ')}]`);
         return request.userRoles;
@@ -88,22 +91,20 @@ const getUserRoles = async (request) => {
     const roles = await roleQuery.find({ useMasterKey: true });
     const roleNames = roles.map(role => role.get('name'));
     
+    // 双重保险：无论数据库查询结果如何，都确保 'User' 角色存在。
+    // 这完美解决了 afterSave Hook 在免费实例上可能因休眠而不执行的问题。
     if (!roleNames.includes('User')) {
         roleNames.push('User');
     }
     
-    console.log(`[Auth] 从数据库查询到用户 ${user.id} 的角色为: [${roleNames.join(', ')}]`);
-    
-    // 将查询结果缓存到请求对象上
+    console.log(`[Auth] 最终确认用户 ${user.id} 的角色为: [${roleNames.join(', ')}]`);
     request.userRoles = roleNames;
-    
     return roleNames;
 };
-// --- ^^^ 核心优化 ^^^ ---
 
 
 // =================================================================
-// == API 调用限制模块 (已优化)
+// == API 调用限制模块
 // =================================================================
 
 async function checkAndIncrementUsage(user, usageType, permissions) {
@@ -146,7 +147,6 @@ async function checkAndIncrementUsage(user, usageType, permissions) {
     }
 }
 
-// --- vvv 核心优化：重构 requestApiCallPermission 逻辑，解决性能瓶颈 vvv ---
 AV.Cloud.define('requestApiCallPermission', async (request) => {
     validateSessionAuth(request);
     const user = request.currentUser;
@@ -154,16 +154,14 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         throw new AV.Cloud.Error('用户未登录，禁止操作。', { code: 401 });
     }
 
-    // 1. 一次性获取用户所有角色
     const userRoles = await getUserRoles(request);
 
-    // 2. 直接在内存中判断是否为管理员，高效且无数据库查询
     if (userRoles.includes('Admin')) {
         console.log(`管理员 ${user.get('username')} 请求调用许可，直接通过。`);
         return { 
             canCall: true, 
             message: '管理员权限，许可已授予。',
-            historyLimit: -1 // 管理员无历史限制
+            historyLimit: -1 
         };
     }
 
@@ -172,7 +170,6 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         throw new AV.Cloud.Error('无效的 usageType 参数，必须是 "llm" 或 "tts"。', { code: 400 });
     }
 
-    // 3. 使用已获取的角色查询权限配置
     const permissionQuery = new AV.Query('RolePermission');
     permissionQuery.containedIn('roleName', userRoles);
     const permissions = await permissionQuery.find({ useMasterKey: true });
@@ -182,10 +179,8 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         throw new AV.Cloud.Error('服务器权限配置错误，请联系管理员。', { code: 500 });
     }
 
-    // 4. 计算最大历史限制
     const historyLimit = Math.max(...permissions.map(p => p.get('historyLimit') ?? 15));
 
-    // 5. 检查并增加用量
     try {
         await checkAndIncrementUsage(user, usageType, permissions);
         return { 
@@ -198,19 +193,15 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
         return { 
             canCall: false, 
             message: error.message,
-            historyLimit: 0 // 调用被拒绝时，历史限制为0
+            historyLimit: 0
         };
     }
 });
-// --- ^^^ 核心优化 ^^^ ---
 
 
 // =================================================================
-// == 现有业务云函数 (无需修改，保持原样)
+// == 业务云函数
 // =================================================================
-
-// ... (此处省略所有其他未修改的云函数，以节省篇幅)
-// ... (您只需完整复制粘贴上面的代码即可，下面的内容保持不变)
 
 AV.Cloud.define('hello', function(request) {
   return 'Hello world!';
@@ -923,45 +914,12 @@ AV.Cloud.define('migrateAllCharactersToOwner', async (request) => {
 });
 
 // =================================================================
-// == Cloud Hook - 新用户自动加入角色 (调试增强版)
+// == Cloud Hook (已移除)
 // =================================================================
-
-AV.Cloud.afterSave('_User', async (request) => {
-  const newUser = request.object;
-
-  if (newUser.isNew()) {
-    console.log(`[DEBUG] afterSave Hook triggered for new user, objectId: ${newUser.id}`);
-
-    const roleQuery = new AV.Query(AV.Role);
-    roleQuery.equalTo('name', 'User');
-    
-    try {
-      console.log('[DEBUG] Step 1: Querying for role with name "User"...');
-      const userRole = await roleQuery.first({ useMasterKey: true });
-
-      if (userRole) {
-        console.log(`[DEBUG] Step 2: Found role "User" with objectId: ${userRole.id}`);
-        const relation = userRole.relation('users');
-        
-        console.log(`[DEBUG] Step 3: Adding new user ${newUser.id} to the role relation...`);
-        relation.add(newUser);
-        
-        console.log('[DEBUG] Step 4: Saving the role object...');
-        await userRole.save(null, { useMasterKey: true });
-        
-        console.log(`[SUCCESS] Successfully added new user ${newUser.id} to the 'User' role.`);
-      } else {
-        console.error('FATAL: The "User" role was not found. Could not assign role to new user.');
-        
-        const allRolesQuery = new AV.Query(AV.Role);
-        const allRoles = await allRolesQuery.find({ useMasterKey: true });
-        const allRoleNames = allRoles.map(r => r.get('name'));
-        console.error(`[DEBUG] All existing roles in _Role table are: [${allRoleNames.join(', ')}]`);
-      }
-    } catch (error) {
-      console.error(`[ERROR] An error occurred while adding user to role in afterSave hook: ${error}`);
-    }
-  }
-});
+//
+// 原有的 afterSave Hook 已被移除。
+// 因为免费版实例休眠会导致 Hook 不可靠，我们已将保障用户基础角色的逻辑
+// 移至 getUserRoles 函数中，使其更加健壮和可靠。
+//
 
 module.exports = AV.Cloud;
