@@ -1,6 +1,6 @@
-// cloud.js (V4.0 - 分类功能修复版)
+// cloud.js (V4.2 - 最终优化版)
 // 变更日志:
-// - 修复：getPopularTags 云函数因调用了不存在的 .aggregate() 方法而报错的问题。
+// - 确认 SDK 已升级，将 getPopularTags 函数恢复为使用高效的 aggregate 聚合查询。
 
 'use strict';
 const AV = require('leanengine');
@@ -727,7 +727,6 @@ AV.Cloud.define('getTrendingCharacters', async (request) => {
   });
 });
 
-// --- vvv 核心修复：使用正确的聚合查询方法 vvv ---
 AV.Cloud.define('getPopularTags', async (request) => {
   validateSessionAuth(request);
   const { limit = 50 } = request.params;
@@ -739,14 +738,11 @@ AV.Cloud.define('getPopularTags', async (request) => {
     { $project: { _id: 0, tag: '$_id', count: '$count' } }
   ];
   
-  // 错误的方式: const query = new AV.Query('Character'); query.aggregate(pipeline);
-  // 正确的方式:
   const Character = AV.Object.extend('Character');
   const results = await Character.aggregate(pipeline);
 
   return results;
 });
-// --- ^^^ 核心修复 ^^^ ---
 
 AV.Cloud.define('getFollowingFeed', async (request) => {
   validateSessionAuth(request);
