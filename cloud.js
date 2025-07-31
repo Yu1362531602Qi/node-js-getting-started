@@ -1,11 +1,6 @@
-// cloud.js (V3.8 - 多维发现版)
+// cloud.js (V3.9 - 热度与UI优化版)
 // 变更日志:
-// - 新增 getTrendingCharacters, getPopularTags, getFollowingFeed 云函数，以支持新版主页。
-// - 彻底移除不可靠的 afterSave Hook。
-// - 强化 getUserRoles 函数，使其能主动为所有用户保障基础 "User" 角色，不再依赖 Hook。
-// - 移除低效的 isAdmin 函数，所有权限检查统一通过 getUserRoles 高效完成。
-// - 修复了因 isAdmin 查询导致的数据库超时性能瓶颈。
-// - 新增 test_addUserToRole 云函数，用于测试和演示如何可靠地向数据库中为用户添加角色。
+// - 新增：getTrendingCharacters 云函数现在会计算并返回一个 'hotness' 热度值字段。
 
 'use strict';
 const AV = require('leanengine');
@@ -72,12 +67,6 @@ AV.Cloud.define('handshake', async (request) => {
   };
 });
 
-/**
- * 高效获取用户角色列表，并内置“双重保险”逻辑。
- * 即使 afterSave Hook 失效，此函数也能确保每个用户至少拥有 'User' 角色。
- * @param {AV.Cloud.Request} request - 云函数请求对象
- * @returns {Promise<string[]>} - 用户的角色名称数组
- */
 const getUserRoles = async (request) => {
     if (request.userRoles) {
         console.log(`[Auth] 从请求缓存中获取用户 ${request.currentUser.id} 的角色: [${request.userRoles.join(', ')}]`);
@@ -93,8 +82,6 @@ const getUserRoles = async (request) => {
     const roles = await roleQuery.find({ useMasterKey: true });
     const roleNames = roles.map(role => role.get('name'));
     
-    // 双重保险：无论数据库查询结果如何，都确保 'User' 角色存在。
-    // 这完美解决了 afterSave Hook 在免费实例上可能因休眠而不执行的问题。
     if (!roleNames.includes('User')) {
         roleNames.push('User');
     }
@@ -209,12 +196,6 @@ AV.Cloud.define('hello', function(request) {
   return 'Hello world!';
 });
 
-/**
- * [仅供测试] 将指定用户添加到一个指定的角色中。
- * 需要管理员权限才能调用。
- * @param {string} targetUserId - 需要被添加角色的用户 objectId
- * @param {string} roleName - 目标角色的名称 (例如 "Sponsor", "Admin")
- */
 AV.Cloud.define('test_addUserToRole', async (request) => {
   const userRoles = await getUserRoles(request);
   if (!userRoles.includes('Admin')) {
@@ -723,17 +704,35 @@ AV.Cloud.define('getUserCreations', async (request) => {
 });
 
 // --- 新增：主页多维发现云函数 ---
+// --- vvv 核心修改：为热门角色增加热度值计算 vvv ---
 AV.Cloud.define('getTrendingCharacters', async (request) => {
   validateSessionAuth(request);
   const { page = 1, limit = 20 } = request.params;
   const query = new AV.Query('Character');
-  query.descending('likeCount', 'chatCount');
+  
+  // 注意：LeanCloud 的查询不支持直接按计算字段排序。
+  // 我们先按 likeCount 和 chatCount 的组合进行预排序，获取一批数据后再精确计算。
+  // 这是一个权衡，对于大多数情况是有效的。
+  query.descending('likeCount', 'chatCount'); 
   query.skip((page - 1) * limit);
   query.limit(limit);
   query.include('author');
+  
   const characters = await query.find({ useMasterKey: true });
-  return characters.map(char => char.toJSON());
+  
+  // 将 AV.Object 转换为普通 JSON 对象，并计算热度值
+  return characters.map(char => {
+    const charJSON = char.toJSON();
+    const likeCount = charJSON.likeCount || 0;
+    const chatCount = charJSON.chatCount || 0;
+    
+    // 计算热度值：点赞数权重为2，聊天数权重为1
+    charJSON.hotness = (likeCount * 2) + chatCount;
+    
+    return charJSON;
+  });
 });
+// --- ^^^ 核心修改 ^^^ ---
 
 AV.Cloud.define('getPopularTags', async (request) => {
   validateSessionAuth(request);
