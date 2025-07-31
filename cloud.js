@@ -1,6 +1,6 @@
-// cloud.js (V3.9 - 热度与UI优化版)
+// cloud.js (V4.0 - 分类功能修复版)
 // 变更日志:
-// - 新增：getTrendingCharacters 云函数现在会计算并返回一个 'hotness' 热度值字段。
+// - 修复：getPopularTags 云函数因调用了不存在的 .aggregate() 方法而报错的问题。
 
 'use strict';
 const AV = require('leanengine');
@@ -704,15 +704,11 @@ AV.Cloud.define('getUserCreations', async (request) => {
 });
 
 // --- 新增：主页多维发现云函数 ---
-// --- vvv 核心修改：为热门角色增加热度值计算 vvv ---
 AV.Cloud.define('getTrendingCharacters', async (request) => {
   validateSessionAuth(request);
   const { page = 1, limit = 20 } = request.params;
   const query = new AV.Query('Character');
   
-  // 注意：LeanCloud 的查询不支持直接按计算字段排序。
-  // 我们先按 likeCount 和 chatCount 的组合进行预排序，获取一批数据后再精确计算。
-  // 这是一个权衡，对于大多数情况是有效的。
   query.descending('likeCount', 'chatCount'); 
   query.skip((page - 1) * limit);
   query.limit(limit);
@@ -720,20 +716,18 @@ AV.Cloud.define('getTrendingCharacters', async (request) => {
   
   const characters = await query.find({ useMasterKey: true });
   
-  // 将 AV.Object 转换为普通 JSON 对象，并计算热度值
   return characters.map(char => {
     const charJSON = char.toJSON();
     const likeCount = charJSON.likeCount || 0;
     const chatCount = charJSON.chatCount || 0;
     
-    // 计算热度值：点赞数权重为2，聊天数权重为1
     charJSON.hotness = (likeCount * 2) + chatCount;
     
     return charJSON;
   });
 });
-// --- ^^^ 核心修改 ^^^ ---
 
+// --- vvv 核心修复：使用正确的聚合查询方法 vvv ---
 AV.Cloud.define('getPopularTags', async (request) => {
   validateSessionAuth(request);
   const { limit = 50 } = request.params;
@@ -744,10 +738,15 @@ AV.Cloud.define('getPopularTags', async (request) => {
     { $limit: limit },
     { $project: { _id: 0, tag: '$_id', count: '$count' } }
   ];
-  const query = new AV.Query('Character');
-  const results = await query.aggregate(pipeline);
+  
+  // 错误的方式: const query = new AV.Query('Character'); query.aggregate(pipeline);
+  // 正确的方式:
+  const Character = AV.Object.extend('Character');
+  const results = await Character.aggregate(pipeline);
+
   return results;
 });
+// --- ^^^ 核心修复 ^^^ ---
 
 AV.Cloud.define('getFollowingFeed', async (request) => {
   validateSessionAuth(request);
