@@ -1,5 +1,6 @@
-// cloud.js (V3.7 - 最终生产版)
+// cloud.js (V3.8 - 多维发现版)
 // 变更日志:
+// - 新增 getTrendingCharacters, getPopularTags, getFollowingFeed 云函数，以支持新版主页。
 // - 彻底移除不可靠的 afterSave Hook。
 // - 强化 getUserRoles 函数，使其能主动为所有用户保障基础 "User" 角色，不再依赖 Hook。
 // - 移除低效的 isAdmin 函数，所有权限检查统一通过 getUserRoles 高效完成。
@@ -718,6 +719,60 @@ AV.Cloud.define('getUserCreations', async (request) => {
   creationsQuery.skip((page - 1) * limit);
   creationsQuery.limit(limit);
   const characters = await creationsQuery.find({ useMasterKey: true });
+  return characters.map(char => char.toJSON());
+});
+
+// --- 新增：主页多维发现云函数 ---
+AV.Cloud.define('getTrendingCharacters', async (request) => {
+  validateSessionAuth(request);
+  const { page = 1, limit = 20 } = request.params;
+  const query = new AV.Query('Character');
+  query.descending('likeCount', 'chatCount');
+  query.skip((page - 1) * limit);
+  query.limit(limit);
+  query.include('author');
+  const characters = await query.find({ useMasterKey: true });
+  return characters.map(char => char.toJSON());
+});
+
+AV.Cloud.define('getPopularTags', async (request) => {
+  validateSessionAuth(request);
+  const { limit = 50 } = request.params;
+  const pipeline = [
+    { $unwind: '$tags' },
+    { $group: { _id: '$tags', count: { $sum: 1 } } },
+    { $sort: { count: -1 } },
+    { $limit: limit },
+    { $project: { _id: 0, tag: '$_id', count: '$count' } }
+  ];
+  const query = new AV.Query('Character');
+  const results = await query.aggregate(pipeline);
+  return results;
+});
+
+AV.Cloud.define('getFollowingFeed', async (request) => {
+  validateSessionAuth(request);
+  const user = request.currentUser;
+  if (!user) {
+    return [];
+  }
+  const { page = 1, limit = 20 } = request.params;
+  const followQuery = new AV.Query('UserFollow');
+  followQuery.equalTo('user', user);
+  followQuery.select('followed');
+  followQuery.limit(1000);
+  const followings = await followQuery.find({ useMasterKey: true });
+  if (followings.length === 0) {
+    return [];
+  }
+  const followedUsers = followings.map(f => f.get('followed'));
+  const feedQuery = new AV.Query('Character');
+  feedQuery.containedIn('author', followedUsers);
+  feedQuery.descending('createdAt');
+  feedQuery.skip((page - 1) * limit);
+  feedQuery.limit(limit);
+  feedQuery.include('author');
+  const characters = await feedQuery.find({ useMasterKey: true });
   return characters.map(char => char.toJSON());
 });
 
