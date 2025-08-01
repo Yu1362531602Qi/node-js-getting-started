@@ -1009,3 +1009,78 @@ AV.Cloud.define('migrateAllCharactersToOwner', async (request) => {
 });
 
 module.exports = AV.Cloud;
+
+// =================================================================
+// == 数据维护云函数 (管理员专用)
+// =================================================================
+
+/**
+ * 批量更新 Character 表中 imageUrl 字段的域名。
+ * 这是一个管理员专用函数，用于数据迁移或更换 CDN 域名。
+ * @param {string} oldDomain - 需要被替换的旧域名，例如 "http://old.domain.com"
+ * @param {string} newDomain - 用来替换的新域名，例如 "http://new.domain.com"
+ */
+AV.Cloud.define('batchUpdateCharacterImageDomains', async (request) => {
+  // 1. 安全校验：确保只有管理员可以执行此操作
+  const userRoles = await getUserRoles(request);
+  if (!userRoles.includes('Admin')) {
+    throw new AV.Cloud.Error('权限不足，仅限管理员操作。', { code: 403 });
+  }
+
+  // 2. 参数校验
+  const { oldDomain, newDomain } = request.params;
+  if (!oldDomain || !newDomain || typeof oldDomain !== 'string' || typeof newDomain !== 'string') {
+    throw new AV.Cloud.Error('参数无效，必须提供 "oldDomain" 和 "newDomain" 字符串。', { code: 400 });
+  }
+  
+  console.log(`开始执行域名替换任务：将 "${oldDomain}" 替换为 "${newDomain}"`);
+
+  // 3. 分批处理逻辑
+  let totalProcessedCount = 0;
+  let totalUpdatedCount = 0;
+  let skip = 0;
+  const limit = 200; // 每次处理200条，防止超时
+  let hasMore = true;
+
+  while (hasMore) {
+    const query = new AV.Query('Character');
+    // 只查询 imageUrl 以旧域名开头的记录
+    query.startsWith('imageUrl', oldDomain);
+    query.limit(limit);
+    query.skip(skip);
+
+    const charactersToUpdate = await query.find({ useMasterKey: true });
+
+    if (charactersToUpdate.length > 0) {
+      const charactersToSave = [];
+      for (const char of charactersToUpdate) {
+        const currentUrl = char.get('imageUrl');
+        // 替换域名并创建新的 URL
+        const newUrl = currentUrl.replace(oldDomain, newDomain);
+        char.set('imageUrl', newUrl);
+        charactersToSave.push(char);
+      }
+
+      if (charactersToSave.length > 0) {
+        await AV.Object.saveAll(charactersToSave, { useMasterKey: true });
+        totalUpdatedCount += charactersToSave.length;
+      }
+      
+      totalProcessedCount += charactersToUpdate.length;
+      console.log(`已处理 ${totalProcessedCount} 条记录，其中更新了 ${charactersToSave.length} 条。`);
+      
+      // 如果返回的数量等于限制数量，说明可能还有更多数据
+      if (charactersToUpdate.length < limit) {
+        hasMore = false;
+      } else {
+        // 准备下一批 (LeanCloud 的 skip 是基于总数的，所以这里不需要增加 skip)
+      }
+    } else {
+      hasMore = false;
+    }
+  }
+
+  const resultMessage = `任务完成！总共检查了 ${totalProcessedCount} 个匹配的角色，其中 ${totalUpdatedCount} 个角色的域名已被成功更新。`;
+  console.log(resultMessage);
+  return resultMessage;
+});
