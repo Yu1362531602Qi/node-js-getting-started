@@ -1,6 +1,7 @@
-// cloud.js (V4.2 - 最终优化版)
+// cloud.js (V4.1 - 分类功能兼容性修复版)
 // 变更日志:
-// - 确认 SDK 已升级，将 getPopularTags 函数恢复为使用高效的 aggregate 聚合查询。
+// - 修复：getPopularTags 云函数在旧版 SDK 环境下因 aggregate 不可用而报错的问题。
+// - 改动：采用分批查询+内存计算的方式实现标签统计，以保证功能兼容性。
 
 'use strict';
 const AV = require('leanengine');
@@ -727,22 +728,55 @@ AV.Cloud.define('getTrendingCharacters', async (request) => {
   });
 });
 
+// --- vvv 核心修复：使用分批查询+内存计算的兼容性方案 vvv ---
 AV.Cloud.define('getPopularTags', async (request) => {
   validateSessionAuth(request);
   const { limit = 50 } = request.params;
-  const pipeline = [
-    { $unwind: '$tags' },
-    { $group: { _id: '$tags', count: { $sum: 1 } } },
-    { $sort: { count: -1 } },
-    { $limit: limit },
-    { $project: { _id: 0, tag: '$_id', count: '$count' } }
-  ];
   
-  const Character = AV.Object.extend('Character');
-  const results = await Character.aggregate(pipeline);
+  const allTags = [];
+  let skip = 0;
+  const queryLimit = 1000; // LeanCloud 单次查询最大限制
+  let hasMore = true;
 
-  return results;
+  while (hasMore) {
+    const query = new AV.Query('Character');
+    query.select('tags'); // 仅查询 tags 字段以优化性能
+    query.exists('tags'); // 仅查询包含 tags 字段的记录
+    query.limit(queryLimit);
+    query.skip(skip);
+    
+    const characters = await query.find({ useMasterKey: true });
+
+    if (characters.length > 0) {
+      for (const char of characters) {
+        const tags = char.get('tags');
+        if (Array.isArray(tags)) {
+          allTags.push(...tags);
+        }
+      }
+      skip += characters.length;
+    }
+    
+    if (characters.length < queryLimit) {
+      hasMore = false;
+    }
+  }
+
+  // 在内存中统计标签频率
+  const tagCounts = allTags.reduce((acc, tag) => {
+    acc[tag] = (acc[tag] || 0) + 1;
+    return acc;
+  }, {});
+
+  // 转换格式、排序并截取
+  const sortedTags = Object.entries(tagCounts)
+    .map(([tag, count]) => ({ tag, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, limit);
+
+  return sortedTags;
 });
+// --- ^^^ 核心修复 ^^^ ---
 
 AV.Cloud.define('getFollowingFeed', async (request) => {
   validateSessionAuth(request);
