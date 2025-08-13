@@ -1042,6 +1042,77 @@ AV.Cloud.define('migrateAllCharactersToOwner', async (request) => {
   return resultMessage;
 });
 
+AV.Cloud.define('batchAddDynamicCharacters', async (request) => {
+  // 1. 权限校验
+  const userRoles = await getUserRoles(request);
+  if (!userRoles.includes('Admin')) {
+    throw new AV.Cloud.Error('权限不足，仅限管理员操作。', { code: 403 });
+  }
+
+  // 2. 参数校验
+  let charactersData;
+  if (Array.isArray(request.params)) {
+    charactersData = request.params;
+  } else if (request.params && Array.isArray(request.params.charactersData)) {
+    charactersData = request.params.charactersData;
+  } else {
+    throw new AV.Cloud.Error('参数格式无效。请直接粘贴角色数组，或使用 {"charactersData": [...]} 的格式。', { code: 400 });
+  }
+  if (charactersData.length === 0) {
+    return "传入的角色数组为空，未执行任何操作。";
+  }
+
+  // 3. 数据准备和ID冲突检查
+  const charactersToSave = [];
+  const DynamicCharacter = AV.Object.extend('DynamicCharacter'); // <-- 目标 Class
+  const existingIds = new Set();
+
+  for (const charData of charactersData) {
+    if (typeof charData.id !== 'number') {
+      throw new AV.Cloud.Error(`发现一个角色数据缺少有效的数字 "id" 字段: ${JSON.stringify(charData)}`, { code: 400 });
+    }
+    if (existingIds.has(charData.id)) {
+       throw new AV.Cloud.Error(`数据中存在重复的ID: ${charData.id}`, { code: 400 });
+    }
+    existingIds.add(charData.id);
+    
+    const newChar = new DynamicCharacter();
+    newChar.set('id', charData.id);
+    newChar.set('name', charData.name || '未命名');
+    newChar.set('description', charData.description || '');
+    newChar.set('imageUrl', charData.imageUrl || ''); // 视频 URL
+    newChar.set('characterPrompt', charData.characterPrompt || '');
+    newChar.set('userProfilePrompt', charData.userProfilePrompt || '');
+    newChar.set('storyBackgroundPrompt', charData.storyBackgroundPrompt || '');
+    newChar.set('storyStartPrompt', charData.storyStartPrompt || '');
+    newChar.set('tags', charData.tags || []);
+    // 新增字段
+    newChar.set('firstSentence', charData['first sentence'] || '');
+    newChar.set('sdPrompt', charData.sd_prompt || '');
+    
+    charactersToSave.push(newChar);
+  }
+
+  const idQuery = new AV.Query('DynamicCharacter'); // <-- 目标 Class
+  idQuery.containedIn('id', Array.from(existingIds));
+  const conflictedChars = await idQuery.find({ useMasterKey: true });
+  if (conflictedChars.length > 0) {
+      const conflictedIds = conflictedChars.map(c => c.get('id'));
+      throw new AV.Cloud.Error(`操作被中断！以下ID已存在于 DynamicCharacter 表中: ${conflictedIds.join(', ')}`, { code: 409 });
+  }
+
+  // 4. 批量保存
+  if (charactersToSave.length > 0) {
+    try {
+      await AV.Object.saveAll(charactersToSave, { useMasterKey: true });
+    } catch (error) {
+      console.error('批量保存动态角色时发生错误:', error);
+      throw new AV.Cloud.Error('批量保存失败，请检查日志。', { code: 500 });
+    }
+  }
+  return `操作成功！成功添加了 ${charactersToSave.length} 个动态角色。`;
+});
+
 module.exports = AV.Cloud;
 
 // =================================================================
