@@ -1,5 +1,6 @@
-// cloud.js (V4.1 - 分类功能兼容性修复版)
+// cloud.js (V4.2 - 动态视频卡片兼容版)
 // 变更日志:
+// - 新增: batchAddOfficialCharacters 函数现在可以处理包含 "first sentence" 和 "sd_prompt" 的动态卡片JSON格式。
 // - 修复：getPopularTags 云函数在旧版 SDK 环境下因 aggregate 不可用而报错的问题。
 // - 改动：采用分批查询+内存计算的方式实现标签统计，以保证功能兼容性。
 
@@ -874,6 +875,7 @@ AV.Cloud.define('publishApprovedCharacters', async (request) => {
   return resultMessage;
 });
 
+// --- vvv 核心修改：适配新的动态卡片JSON格式 vvv ---
 AV.Cloud.define('batchAddOfficialCharacters', async (request) => {
   const userRoles = await getUserRoles(request);
   if (!userRoles.includes('Admin')) {
@@ -911,6 +913,11 @@ AV.Cloud.define('batchAddOfficialCharacters', async (request) => {
     newChar.set('storyBackgroundPrompt', charData.storyBackgroundPrompt || '');
     newChar.set('storyStartPrompt', charData.storyStartPrompt || '');
     newChar.set('tags', charData.tags || []);
+    
+    // 新增字段
+    newChar.set('firstSentence', charData['first sentence'] || charData.description || '');
+    newChar.set('sdPrompt', charData.sd_prompt || '');
+
     charactersToSave.push(newChar);
   }
   const idQuery = new AV.Query('Character');
@@ -930,6 +937,7 @@ AV.Cloud.define('batchAddOfficialCharacters', async (request) => {
   }
   return `操作成功！成功添加了 ${charactersToSave.length} 个官方角色。`;
 });
+// --- ^^^ 核心修改 ^^^ ---
 
 AV.Cloud.define('batchDeleteCharacters', async (request) => {
   const userRoles = await getUserRoles(request);
