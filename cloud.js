@@ -1,5 +1,6 @@
-// cloud.js (V4.3 - 移除热门和分类功能)
+// cloud.js (V4.4 - 自动绑定作者)
 // 变更日志:
+// - 新增: batchAddOfficialCharacters 函数现在会自动将当前操作的管理员设置为新角色的作者。
 // - 移除: getTrendingCharacters 云函数已被删除。
 // - 移除: getPopularTags 云函数已被删除。
 // - 新增: batchAddOfficialCharacters 函数现在可以处理包含 "first sentence" 和 "sd_prompt" 的动态卡片JSON格式。
@@ -804,12 +805,18 @@ AV.Cloud.define('publishApprovedCharacters', async (request) => {
   return resultMessage;
 });
 
-// --- vvv 核心修改：适配新的动态卡片JSON格式 vvv ---
 AV.Cloud.define('batchAddOfficialCharacters', async (request) => {
   const userRoles = await getUserRoles(request);
   if (!userRoles.includes('Admin')) {
     throw new AV.Cloud.Error('权限不足，仅限管理员操作。', { code: 403 });
   }
+  
+  const adminUser = request.currentUser;
+  if (!adminUser) {
+    throw new AV.Cloud.Error('无法获取管理员用户信息。', { code: 401 });
+  }
+  const adminUsername = adminUser.get('username');
+
   let charactersData;
   if (Array.isArray(request.params)) {
     charactersData = request.params;
@@ -842,10 +849,11 @@ AV.Cloud.define('batchAddOfficialCharacters', async (request) => {
     newChar.set('storyBackgroundPrompt', charData.storyBackgroundPrompt || '');
     newChar.set('storyStartPrompt', charData.storyStartPrompt || '');
     newChar.set('tags', charData.tags || []);
-    
-    // 新增字段
     newChar.set('firstSentence', charData['first sentence'] || charData.description || '');
     newChar.set('sdPrompt', charData.sd_prompt || '');
+
+    newChar.set('author', adminUser); 
+    newChar.set('authorName', adminUsername);
 
     charactersToSave.push(newChar);
   }
@@ -864,9 +872,8 @@ AV.Cloud.define('batchAddOfficialCharacters', async (request) => {
       throw new AV.Cloud.Error('批量保存失败，请检查日志。', { code: 500 });
     }
   }
-  return `操作成功！成功添加了 ${charactersToSave.length} 个官方角色。`;
+  return `操作成功！成功添加了 ${charactersToSave.length} 个官方角色，并自动绑定作者为 "${adminUsername}"。`;
 });
-// --- ^^^ 核心修改 ^^^ ---
 
 AV.Cloud.define('batchDeleteCharacters', async (request) => {
   const userRoles = await getUserRoles(request);
