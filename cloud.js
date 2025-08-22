@@ -1,13 +1,18 @@
-// cloud.js (V4.6 - 使用云函数替代Hook进行设备ID校验)
+// cloud.js (V4.7 - 修复注册后客户端报错的问题)
 // 变更日志:
-// - 新增: `secureRegister` 云函数，用于处理用户注册，并在内部进行设备ID校验。
-// - 移除: `AV.Cloud.beforeSave('_User')` 钩子，因为它在当前环境中不工作。
-// - 客户端的注册流程需要同步修改，以调用 `secureRegister` 而不是标准的注册API。
+// - 修复: `secureRegister` 云函数中的 `user.signUp()` 在某些情况下不返回正确的 sessionToken，导致客户端解析失败。
+// - 改动: `secureRegister` 逻辑调整为先使用 masterKey 创建用户，然后立即使用该用户的凭据登录一次，以确保能稳定地生成并返回包含 sessionToken 的完整用户信息。
 
 'use strict';
 const AV = require('leanengine');
 const qiniu = require('qiniu');
 const crypto = require('crypto');
+
+// =================================================================
+// == 数据校验钩子 (Hooks) - 已移除
+// =================================================================
+// AV.Cloud.beforeSave('_User', ...) 已被 secureRegister 云函数替代
+
 
 // =================================================================
 // == 安全校验与角色管理核心模块
@@ -194,18 +199,14 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
 // == 业务云函数
 // =================================================================
 
-// --- vvv 核心新增：安全的注册云函数 vvv ---
+// --- vvv 核心修改：安全的注册云函数（修复版） vvv ---
 AV.Cloud.define('secureRegister', async (request) => {
-  // 注意：注册是公开行为，不应该调用 validateSessionAuth
-  
   const { username, email, password, deviceId } = request.params;
 
-  // 1. 服务器端再次校验参数
   if (!username || !email || !password || !deviceId) {
     throw new AV.Cloud.Error('所有字段均为必填项。', { code: 400 });
   }
   
-  // 2. 校验设备ID是否已存在
   console.log(`收到新用户注册请求，开始校验设备ID: ${deviceId}`);
   const deviceQuery = new AV.Query('_User');
   deviceQuery.equalTo('deviceId', deviceId);
@@ -213,31 +214,38 @@ AV.Cloud.define('secureRegister', async (request) => {
 
   if (existingUserByDevice) {
     console.warn(`注册请求被拒绝：设备ID "${deviceId}" 已被用户 ${existingUserByDevice.id} 注册。`);
-    throw new AV.Cloud.Error('该设备已注册过账户，请直接登录。', { code: 409 }); // 409 Conflict
+    throw new AV.Cloud.Error('该设备已注册过账户，请直接登录。', { code: 409 });
   }
   console.log(`设备ID "${deviceId}" 校验通过。`);
 
-  // 3. 创建新用户
   const user = new AV.User();
   user.set('username', username);
   user.set('password', password);
   user.set('email', email);
-  user.set('deviceId', deviceId); // 保存设备ID
+  user.set('deviceId', deviceId);
 
   try {
-    // 使用 signUp 方法注册用户
+    // 【关键改动】
+    // 1. 先用 signUp 方法注册用户。这个方法会处理密码加密等所有必要操作。
+    //    此时 user 对象会被 LeanCloud 自动填充 objectId 等信息，但可能不包含 sessionToken。
     await user.signUp(null, { useMasterKey: true });
-    console.log(`新用户 ${username} (${user.id}) 注册成功。`);
-    // signUp 成功后，user 对象会自动包含 sessionToken
-    return user.toJSON();
+    console.log(`新用户 ${username} (${user.id}) 已在数据库中创建。`);
+
+    // 2. 紧接着，我们用刚刚注册成功的用户名和原始密码为这个新用户执行一次登录操作。
+    //    这个操作的目的是为了生成一个全新的、有效的 sessionToken。
+    console.log(`为新用户 ${username} 生成 sessionToken...`);
+    const loggedInUser = await AV.User.logInWithPassword(username, password);
+    console.log(`为新用户 ${username} 生成 sessionToken 成功。`);
+
+    // 3. 返回这个刚刚登录成功的 user 对象。它包含了客户端需要的所有信息，特别是 sessionToken。
+    return loggedInUser.toJSON();
+
   } catch (error) {
-    // 捕获 LeanCloud 可能返回的错误，例如邮箱或用户名已存在
     console.error(`用户 ${username} 注册失败:`, error);
-    // 将 LeanCloud 的错误信息原样或格式化后抛出
     throw new AV.Cloud.Error(error.message || '注册时发生未知错误。', { code: error.code || 500 });
   }
 });
-// --- ^^^ 核心新增 ^^^ ---
+// --- ^^^ 核心修改 ^^^ ---
 
 AV.Cloud.define('hello', function(request) {
   return 'Hello world!';
