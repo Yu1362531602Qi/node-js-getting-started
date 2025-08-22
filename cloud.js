@@ -1,5 +1,6 @@
-// cloud.js (V4.4 - 自动绑定作者)
+// cloud.js (V4.5 - 增加设备ID校验)
 // 变更日志:
+// - 新增: AV.Cloud.beforeSave('_User') 钩子，用于在用户注册时校验 deviceId，防止单设备多账号注册。
 // - 新增: batchAddOfficialCharacters 函数现在会自动将当前操作的管理员设置为新角色的作者。
 // - 移除: getTrendingCharacters 云函数已被删除。
 // - 移除: getPopularTags 云函数已被删除。
@@ -11,6 +12,48 @@
 const AV = require('leanengine');
 const qiniu = require('qiniu');
 const crypto = require('crypto');
+
+// =================================================================
+// == 数据校验钩子 (Hooks)
+// =================================================================
+
+/**
+ * 在新用户注册（保存）之前执行的钩子函数。
+ * 用于校验设备ID，防止单设备重复注册。
+ */
+AV.Cloud.beforeSave('_User', async (request) => {
+  // 仅对新创建的用户（即注册操作）进行校验
+  if (!request.object.existed()) {
+    console.log('检测到新用户注册，开始校验设备ID...');
+    
+    // 从即将保存的对象中获取 deviceId
+    const deviceId = request.object.get('deviceId');
+
+    // 如果客户端没有提供 deviceId，则拒绝注册
+    if (!deviceId) {
+      console.error('注册请求被拒绝：缺少 deviceId。');
+      throw new AV.Cloud.Error('缺少设备信息，无法注册。', { code: 400 });
+    }
+
+    // 查询 _User 表中是否已存在相同的 deviceId
+    const query = new AV.Query('_User');
+    query.equalTo('deviceId', deviceId);
+    
+    // 使用 masterKey 进行查询，以忽略 ACL 限制，确保能查到所有用户
+    const existingUser = await query.first({ useMasterKey: true });
+
+    // 如果找到了已存在相同 deviceId 的用户，则抛出错误，阻止本次注册
+    if (existingUser) {
+      console.warn(`注册请求被拒绝：设备ID "${deviceId}" 已被用户 ${existingUser.id} 注册。`);
+      // 使用 409 Conflict 状态码表示资源冲突
+      throw new AV.Cloud.Error('该设备已注册过账户，请直接登录。', { code: 409 });
+    }
+
+    console.log(`设备ID "${deviceId}" 校验通过，允许新用户注册。`);
+  }
+  // 如果是更新用户操作，或者新用户校验通过，则不执行任何操作，允许保存
+});
+
 
 // =================================================================
 // == 安全校验与角色管理核心模块
@@ -986,8 +1029,6 @@ AV.Cloud.define('migrateAllCharactersToOwner', async (request) => {
   return resultMessage;
 });
 
-module.exports = AV.Cloud;
-
 // =================================================================
 // == 数据维护云函数 (管理员专用)
 // =================================================================
@@ -1062,3 +1103,5 @@ AV.Cloud.define('batchUpdateCharacterImageDomains', async (request) => {
   console.log(resultMessage);
   return resultMessage;
 });
+
+module.exports = AV.Cloud;
