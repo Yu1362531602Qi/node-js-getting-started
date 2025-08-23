@@ -1,7 +1,7 @@
-// cloud.js (V4.9 - 粉丝/关注列表安全加固)
+// cloud.js (V4.8 - 最终稳定版)
 // 变更日志:
-// - 安全修复: `getFollowers` 和 `getFollowing` 云函数现在会过滤掉指向已删除用户的记录，防止返回 null 对象导致客户端崩溃。
-// - 健壮性: 确保了即使数据库中存在脏数据（例如，用户被删除但其关注关系未被级联删除），API 依然能稳定返回有效数据。
+// - 修复: `secureRegister` 云函数不再尝试登录，只负责创建用户并返回成功状态，避免了 SDK 方法不存在的错误。
+// - 流程变更: 客户端在接收到注册成功的回调后，将自动发起一次标准的登录请求来获取 sessionToken。
 
 'use strict';
 const AV = require('leanengine');
@@ -193,6 +193,7 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
 // == 业务云函数
 // =================================================================
 
+// --- vvv 核心修改：安全的注册云函数（最终稳定版） vvv ---
 AV.Cloud.define('secureRegister', async (request) => {
   const { username, email, password, deviceId } = request.params;
 
@@ -218,20 +219,20 @@ AV.Cloud.define('secureRegister', async (request) => {
   user.set('deviceId', deviceId);
 
   try {
+    // 使用 signUp 方法注册用户，这个方法会处理密码加密等所有必要操作。
     await user.signUp(null, { useMasterKey: true });
     console.log(`新用户 ${username} (${user.id}) 已在数据库中创建。`);
     
-    console.log(`为新用户 ${username} 生成 sessionToken...`);
-    const loggedInUser = await AV.User.logInWithPassword(username, password);
-    console.log(`为新用户 ${username} 生成 sessionToken 成功。`);
-
-    return loggedInUser.toJSON();
+    // 注册成功后，只返回一个简单的成功状态，不返回用户信息。
+    // 客户端将根据这个成功状态，自行发起登录请求。
+    return { success: true, message: '注册成功' };
 
   } catch (error) {
     console.error(`用户 ${username} 注册失败:`, error);
     throw new AV.Cloud.Error(error.message || '注册时发生未知错误。', { code: error.code || 500 });
   }
 });
+// --- ^^^ 核心修改 ^^^ ---
 
 AV.Cloud.define('hello', function(request) {
   return 'Hello world!';
@@ -462,7 +463,6 @@ AV.Cloud.define('unfollowUser', async (request) => {
   return { success: true, message: '取消关注成功' };
 });
 
-// --- vvv 核心修改：安全加固 getFollowers vvv ---
 AV.Cloud.define('getFollowers', async (request) => {
   validateSessionAuth(request);
   const { targetUserId, page = 1, limit = 20 } = request.params;
@@ -472,21 +472,15 @@ AV.Cloud.define('getFollowers', async (request) => {
   const targetUser = AV.Object.createWithoutData('_User', targetUserId);
   const query = new AV.Query('UserFollow');
   query.equalTo('followed', targetUser);
-  query.include('user'); // 包含 'user' 字段的完整对象
+  query.include('user');
   query.select('user.username', 'user.avatarUrl', 'user.objectId');
   query.skip((page - 1) * limit);
   query.limit(limit);
   query.descending('createdAt');
   const results = await query.find();
-  
-  // 过滤掉那些 'user' 字段为 null 或 undefined 的记录
-  return results
-    .map(follow => follow.get('user'))
-    .filter(userObject => userObject != null); // 关键过滤步骤
+  return results.map(follow => follow.get('user'));
 });
-// --- ^^^ 核心修改 ^^^ ---
 
-// --- vvv 核心修改：安全加固 getFollowing vvv ---
 AV.Cloud.define('getFollowing', async (request) => {
   validateSessionAuth(request);
   const { targetUserId, page = 1, limit = 20 } = request.params;
@@ -496,20 +490,14 @@ AV.Cloud.define('getFollowing', async (request) => {
   const targetUser = AV.Object.createWithoutData('_User', targetUserId);
   const query = new AV.Query('UserFollow');
   query.equalTo('user', targetUser);
-  query.include('followed'); // 包含 'followed' 字段的完整对象
+  query.include('followed');
   query.select('followed.username', 'followed.avatarUrl', 'followed.objectId');
   query.skip((page - 1) * limit);
   query.limit(limit);
   query.descending('createdAt');
   const results = await query.find();
-
-  // 过滤掉那些 'followed' 字段为 null 或 undefined 的记录
-  return results
-    .map(follow => follow.get('followed'))
-    .filter(userObject => userObject != null); // 关键过滤步骤
+  return results.map(follow => follow.get('followed'));
 });
-// --- ^^^ 核心修改 ^^^ ---
-
 
 // --- 角色与创作管理 ---
 AV.Cloud.define('generateNewLocalCharacterId', async (request) => {
