@@ -1,7 +1,7 @@
-// cloud.js (V4.10 - 数据一致性修复)
+// cloud.js (V4.9 - 粉丝/关注列表安全加固)
 // 变更日志:
-// - 修复: `getUserPublicProfile` 云函数不再信任 _User 表中缓存的 followersCount 和 followingCount 字段。
-// - 改动: `getUserPublicProfile` 现在会实时查询 UserFollow 表来计算准确的粉丝数和关注数，从根本上解决因用户删除导致的计数不一致问题。
+// - 安全修复: `getFollowers` 和 `getFollowing` 云函数现在会过滤掉指向已删除用户的记录，防止返回 null 对象导致客户端崩溃。
+// - 健壮性: 确保了即使数据库中存在脏数据（例如，用户被删除但其关注关系未被级联删除），API 依然能稳定返回有效数据。
 
 'use strict';
 const AV = require('leanengine');
@@ -222,7 +222,7 @@ AV.Cloud.define('secureRegister', async (request) => {
     console.log(`新用户 ${username} (${user.id}) 已在数据库中创建。`);
     
     console.log(`为新用户 ${username} 生成 sessionToken...`);
-    const loggedInUser = await AV.User.logIn(username, password); // 使用 logIn 替代 logInWithPassword
+    const loggedInUser = await AV.User.logInWithPassword(username, password);
     console.log(`为新用户 ${username} 生成 sessionToken 成功。`);
 
     return loggedInUser.toJSON();
@@ -462,6 +462,7 @@ AV.Cloud.define('unfollowUser', async (request) => {
   return { success: true, message: '取消关注成功' };
 });
 
+// --- vvv 核心修改：安全加固 getFollowers vvv ---
 AV.Cloud.define('getFollowers', async (request) => {
   validateSessionAuth(request);
   const { targetUserId, page = 1, limit = 20 } = request.params;
@@ -471,18 +472,21 @@ AV.Cloud.define('getFollowers', async (request) => {
   const targetUser = AV.Object.createWithoutData('_User', targetUserId);
   const query = new AV.Query('UserFollow');
   query.equalTo('followed', targetUser);
-  query.include('user');
+  query.include('user'); // 包含 'user' 字段的完整对象
   query.select('user.username', 'user.avatarUrl', 'user.objectId');
   query.skip((page - 1) * limit);
   query.limit(limit);
   query.descending('createdAt');
   const results = await query.find();
   
+  // 过滤掉那些 'user' 字段为 null 或 undefined 的记录
   return results
     .map(follow => follow.get('user'))
-    .filter(userObject => userObject != null);
+    .filter(userObject => userObject != null); // 关键过滤步骤
 });
+// --- ^^^ 核心修改 ^^^ ---
 
+// --- vvv 核心修改：安全加固 getFollowing vvv ---
 AV.Cloud.define('getFollowing', async (request) => {
   validateSessionAuth(request);
   const { targetUserId, page = 1, limit = 20 } = request.params;
@@ -492,17 +496,19 @@ AV.Cloud.define('getFollowing', async (request) => {
   const targetUser = AV.Object.createWithoutData('_User', targetUserId);
   const query = new AV.Query('UserFollow');
   query.equalTo('user', targetUser);
-  query.include('followed');
+  query.include('followed'); // 包含 'followed' 字段的完整对象
   query.select('followed.username', 'followed.avatarUrl', 'followed.objectId');
   query.skip((page - 1) * limit);
   query.limit(limit);
   query.descending('createdAt');
   const results = await query.find();
 
+  // 过滤掉那些 'followed' 字段为 null 或 undefined 的记录
   return results
     .map(follow => follow.get('followed'))
-    .filter(userObject => userObject != null);
+    .filter(userObject => userObject != null); // 关键过滤步骤
 });
+// --- ^^^ 核心修改 ^^^ ---
 
 
 // --- 角色与创作管理 ---
@@ -677,7 +683,6 @@ AV.Cloud.define('searchPublicContent', async (request) => {
 });
 
 // --- 用户主页 ---
-// --- vvv 核心修改：使用实时 count 查询代替缓存字段 vvv ---
 AV.Cloud.define('getUserPublicProfile', async (request) => {
   validateSessionAuth(request);
   const { userId } = request.params;
@@ -685,64 +690,41 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
   if (!userId) {
     throw new AV.Cloud.Error('必须提供 userId 参数。', { code: 400 });
   }
-
-  const targetUserPointer = AV.Object.createWithoutData('_User', userId);
-
-  // 准备并行执行所有查询
   const userQuery = new AV.Query('_User');
-  userQuery.select(['username', 'avatarUrl', 'objectId', 'bio']);
-
+  userQuery.select(['username', 'avatarUrl', 'objectId', 'followingCount', 'followersCount', 'bio']);
+  const user = await userQuery.get(userId, { useMasterKey: true });
+  if (!user) {
+    throw new AV.Cloud.Error('用户不存在。', { code: 404 });
+  }
   const creationsCountQuery = new AV.Query('Character');
-  creationsCountQuery.equalTo('author', targetUserPointer);
-
-  const followersCountQuery = new AV.Query('UserFollow');
-  followersCountQuery.equalTo('followed', targetUserPointer);
-
-  const followingCountQuery = new AV.Query('UserFollow');
-  followingCountQuery.equalTo('user', targetUserPointer);
-
-  // 并行执行获取用户基本信息和三个 count 查询
-  const [user, creationsCount, followersCount, followingCount] = await Promise.all([
-    userQuery.get(userId, { useMasterKey: true }).catch(err => {
-      if (err.code === 101) throw new AV.Cloud.Error('用户不存在。', { code: 404 });
-      throw err;
-    }),
-    creationsCountQuery.count({ useMasterKey: true }),
-    followersCountQuery.count({ useMasterKey: true }),
-    followingCountQuery.count({ useMasterKey: true })
-  ]);
-
-  // 计算获赞数（这个逻辑比较复杂，保持原有循环方式）
+  creationsCountQuery.equalTo('author', AV.Object.createWithoutData('_User', userId));
+  const creationsCount = await creationsCountQuery.count({ useMasterKey: true });
   let totalLikes = 0;
-  let hasMoreLikes = true;
-  let likesSkip = 0;
-  const likesLimit = 1000;
-  while (hasMoreLikes) {
+  let hasMore = true;
+  let skip = 0;
+  const limit = 1000;
+  while (hasMore) {
     const likesQuery = new AV.Query('Character');
-    likesQuery.equalTo('author', targetUserPointer);
+    likesQuery.equalTo('author', AV.Object.createWithoutData('_User', userId));
     likesQuery.select(['likeCount']);
-    likesQuery.limit(likesLimit);
-    likesQuery.skip(likesSkip);
+    likesQuery.limit(limit);
+    likesQuery.skip(skip);
     const characters = await likesQuery.find({ useMasterKey: true });
     if (characters.length > 0) {
       for (const char of characters) {
         totalLikes += char.get('likeCount') || 0;
       }
-      likesSkip += characters.length;
+      skip += characters.length;
     } else {
-      hasMoreLikes = false;
+      hasMore = false;
     }
   }
-
-  // 组装准确的统计数据
   const stats = {
-    following: followingCount,
-    followers: followersCount,
+    following: user.get('followingCount') || 0,
+    followers: user.get('followersCount') || 0,
     likesReceived: totalLikes,
     creations: creationsCount,
   };
-
-  // 检查当前用户是否关注了目标用户
   let isFollowing = false;
   if (currentUser && currentUser.id !== userId) {
     const followQuery = new AV.Query('UserFollow');
@@ -753,14 +735,12 @@ AV.Cloud.define('getUserPublicProfile', async (request) => {
       isFollowing = true;
     }
   }
-
   return {
     user: user.toJSON(),
     stats: stats,
     isFollowing: isFollowing,
   };
 });
-// --- ^^^ 核心修改 ^^^ ---
 
 AV.Cloud.define('getUserCreations', async (request) => {
   validateSessionAuth(request);
