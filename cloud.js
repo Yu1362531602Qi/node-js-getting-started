@@ -1,18 +1,12 @@
-// cloud.js (V4.7 - 修复注册后客户端报错的问题)
+// cloud.js (V4.8 - 最终稳定版)
 // 变更日志:
-// - 修复: `secureRegister` 云函数中的 `user.signUp()` 在某些情况下不返回正确的 sessionToken，导致客户端解析失败。
-// - 改动: `secureRegister` 逻辑调整为先使用 masterKey 创建用户，然后立即使用该用户的凭据登录一次，以确保能稳定地生成并返回包含 sessionToken 的完整用户信息。
+// - 修复: `secureRegister` 云函数不再尝试登录，只负责创建用户并返回成功状态，避免了 SDK 方法不存在的错误。
+// - 流程变更: 客户端在接收到注册成功的回调后，将自动发起一次标准的登录请求来获取 sessionToken。
 
 'use strict';
 const AV = require('leanengine');
 const qiniu = require('qiniu');
 const crypto = require('crypto');
-
-// =================================================================
-// == 数据校验钩子 (Hooks) - 已移除
-// =================================================================
-// AV.Cloud.beforeSave('_User', ...) 已被 secureRegister 云函数替代
-
 
 // =================================================================
 // == 安全校验与角色管理核心模块
@@ -199,7 +193,7 @@ AV.Cloud.define('requestApiCallPermission', async (request) => {
 // == 业务云函数
 // =================================================================
 
-// --- vvv 核心修改：安全的注册云函数（修复版） vvv ---
+// --- vvv 核心修改：安全的注册云函数（最终稳定版） vvv ---
 AV.Cloud.define('secureRegister', async (request) => {
   const { username, email, password, deviceId } = request.params;
 
@@ -225,20 +219,13 @@ AV.Cloud.define('secureRegister', async (request) => {
   user.set('deviceId', deviceId);
 
   try {
-    // 【关键改动】
-    // 1. 先用 signUp 方法注册用户。这个方法会处理密码加密等所有必要操作。
-    //    此时 user 对象会被 LeanCloud 自动填充 objectId 等信息，但可能不包含 sessionToken。
+    // 使用 signUp 方法注册用户，这个方法会处理密码加密等所有必要操作。
     await user.signUp(null, { useMasterKey: true });
     console.log(`新用户 ${username} (${user.id}) 已在数据库中创建。`);
-
-    // 2. 紧接着，我们用刚刚注册成功的用户名和原始密码为这个新用户执行一次登录操作。
-    //    这个操作的目的是为了生成一个全新的、有效的 sessionToken。
-    console.log(`为新用户 ${username} 生成 sessionToken...`);
-    const loggedInUser = await AV.User.logInWithPassword(username, password);
-    console.log(`为新用户 ${username} 生成 sessionToken 成功。`);
-
-    // 3. 返回这个刚刚登录成功的 user 对象。它包含了客户端需要的所有信息，特别是 sessionToken。
-    return loggedInUser.toJSON();
+    
+    // 注册成功后，只返回一个简单的成功状态，不返回用户信息。
+    // 客户端将根据这个成功状态，自行发起登录请求。
+    return { success: true, message: '注册成功' };
 
   } catch (error) {
     console.error(`用户 ${username} 注册失败:`, error);
