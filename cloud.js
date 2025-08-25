@@ -900,6 +900,14 @@ AV.Cloud.define('batchAddOfficialCharacters', async (request) => {
     newChar.set('firstSentence', charData['first sentence'] || charData.description || '');
     newChar.set('sdPrompt', charData.sd_prompt || '');
 
+    // --- vvv 核心新增：处理群聊相关字段 vvv ---
+    newChar.set('isGroup', charData.isGroup || false);
+    // 将 muiPrompt 数组转换为 JSON 字符串再存储
+    if (charData.muiPrompt && Array.isArray(charData.muiPrompt)) {
+      newChar.set('muiPrompt', JSON.stringify(charData.muiPrompt));
+    }
+    // --- ^^^ 核心新增 ^^^ ---
+
     newChar.set('author', adminUser); 
     newChar.set('authorName', adminUsername);
 
